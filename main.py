@@ -39,7 +39,7 @@ class KaggricultureAgent:
             if step > 0 and step % 24 == 0:
                 day = step // 24
                 # Mock missed waterings and idle fraction for now
-                self.care_monitor.observe_day(self.rules, day, [], 0)
+                self.care_monitor.observe_day(day, 0)
                 
                 # Mock realized money and yesterday's projection
                 realized_money = 1000

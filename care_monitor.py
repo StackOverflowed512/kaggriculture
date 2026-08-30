@@ -16,7 +16,7 @@ class CareMonitor:
             # Expand slowly
             self.capacity_target = min(100, self.capacity_target + 1)
             
-    def observe_day(self, rules: dict, day: int, plants_state: list, missed_waterings: int):
+    def observe_day(self, day: int, missed_waterings: int):
         """
         Observes the daily outcome. Shrinks capacity if plants missed water.
         """
