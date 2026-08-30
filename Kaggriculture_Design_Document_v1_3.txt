@@ -1,0 +1,288 @@
+KAGGRICULTURE
+System Design Document
+Design derived from the current Kaggriculture handover and implemented architecture
+Version: 1.3
+Status: Current architecture baseline — aligned with finalized Handover
+1. Purpose
+Kaggriculture is an autonomous farming agent designed for the Kaggle environment. The system operates a farm over a fixed 720-turn season and optimizes for terminal cash. The design separates immutable game rules from strategy policy, runtime state, validation, and release controls so that the agent can evolve without duplicating the game's domain constants.
+Primary design objective
+Maximize realizable terminal cash by the end of the season while maintaining legal actions, meeting daily crop-care obligations, respecting worker and market constraints, and surviving unexpected runtime failures without terminating the season.
+2. Scope and Non-Goals
+In scope
+Current status
+Crop planting, watering and harvesting
+Active
+Weed clearing
+Active
+Worker hiring and task allocation
+Active
+Movement and distance-aware task assignment
+Active (greedy Manhattan stepping)
+Market pricing and sell decisions
+Active
+Terminal-cash forecasting
+Active
+Adaptive production capacity
+Active
+Endgame liquidation
+Active, subject to final-hour edge case
+Rule provenance and validation
+Active
+Animal lifecycle and care
+Not implemented; explicitly disabled by ANIMALS_ENABLED
+Fertilizer — market purchase
+Not implemented — the engine permits purchasing it directly (op BUY_PRODUCT, item FERTILIZER — BUY_PRODUCT is the single opcode; FERTILIZER is an argument value, not a separate op), but no code path in this agent has ever attempted that call. This is a gap, not a policy choice; nothing was built and switched off, unlike town-demand forecasting.
+Fertilizer — animal-sourced production
+Not implemented (depends on animals)
+Town-demand forecasting
+Built, disabled by policy (measured harm)
+Neighbour tracking
+Built/experimental, disabled by policy
+Telemetry subsystem
+Minimal in-process only — Forecaster.history, CareMonitor.log and the exception log all exist in memory for the running episode; none is persisted for post-season analysis
+Counterfactual branching
+Not implemented
+3. Architectural Principles
+•  Single source of truth for game-domain constants: validated rule data, rather than duplicated constants inside strategy logic.
+•  Separate laws, policy dials, recurring chores, and runtime-derived values.
+•  Fail safe at runtime: the public agent wrapper does not crash the season; unexpected exceptions degrade to PASS and are counted.
+•  Validation is part of the architecture, not an afterthought: rules, action legality, release checks, and performance evaluation are independent layers.
+•  Measured strategies may be disabled without being deleted when evidence shows they are harmful.
+•  A handover must distinguish implemented capability, tested behaviour, disabled capability, unimplemented capability, and deliberate alternative design.
+•  Engine contract is non-negotiable: actions are lists, workers must stand on the tile they act on, and a single timeout or illegal response can zero the season.
+4. Engine Contract (Non-Negotiable)
+These constraints come from the official Kaggle environment and the finalized Handover. Violating them produces silent no-ops, TIMEOUT/ERROR/INVALID status, or a zeroed season score. They are architectural requirements, not policy dials.
+4.1 Action format
+•  Every unit command and market order must be a Python list, never a dictionary.
+•  Correct: ["WATER"], ["NORTH"], ["PLANT", "WHEAT"], ["SELL", "CARROT", 5]
+•  Incorrect: {"type": "WATER"} — silently ignored by the engine.
+•  One action per worker per turn: either one step or one work action.
+•  Individual actions and market orders are emitted as lists; the overall agent return value is a dictionary containing those lists under keys farmer, hands, and market.
+4.2 Movement and standing position
+•  Movement is relative and step-by-step: ["NORTH"], ["SOUTH"], ["EAST"], ["WEST"].
+•  A worker must stand on the target tile (boots in the dirt) before WATER, HARVEST, PLANT, DIG, FEED, CARE, BUILD_*, or PLACE will succeed.
+•  Shed access is the only exception: DROP / PICKUP work from any of the four centre tiles (4,4), (5,4), (4,5), (5,5).
+•  LOCKED tiles are walkable but not plantable or buildable.
+4.3 Timing and failure modes
+•  The agent must return within the act timeout (default 1 second).
+•  remainingOverageTime starts at 60 seconds total across the season and never refills. The buffer only covers occasional slowness, not systematic latency.
+•  A turn that times out, errors, or returns an illegal structure is marked TIMEOUT / ERROR / INVALID and the farm's score for the season is set to nothing.
+•  The public agent() wrapper must never raise; any exception degrades to a legal PASS and is counted.
+4.4 Market and inventory
+•  At most maxMarketOrdersPerTurn (default 10) market orders are processed; extras are dropped.
+•  Sells are fulfilled only from shed inventory, never from a worker's carried load.
+•  Seeds do not count toward the 100-item shed capacity.
+•  All market prices have a floor of $1 per unit; price curves asymptotically approach this floor rather than reaching zero. At $1 the agent is effectively giving the product away.
+5. High-Level Architecture
+Component
+Responsibility
+agent(obs, config)
+Public Kaggle entry point; invokes protected internal execution; never raises.
+RulesLoader
+Resolves and validates the rules source and records provenance.
+MarketModel
+Computes live prices, sell values, production economics and crop rankings. Stateless pure functions.
+Forecaster
+Projects terminal bank and tracks forecast calibration/diagnosis.
+CareMonitor
+Tracks crop-care coverage, losses and production capacity. Shrinks acreage after missed watering; expands when crew idles.
+Scheduler
+Builds tasks from daily_routines, applies urgency bands, assigns workers by minimum distance within each band. DROP pre-empts band assignment.
+ActionEmitter
+Produces engine-compatible list-based actions and market orders. Individual commands are lists; the return envelope is a dict of those lists.
+Validation tools
+Revalidate strategy assumptions, audit legality, run release checks and evaluate changes.
+Logical flow
+Kaggle → agent() → protected internal execution → RulesLoader → runtime models (MarketModel, Forecaster, CareMonitor) → Scheduler → ActionEmitter → engine.
+6. Rules and Configuration Design
+The strategy must not maintain a second copy of game-domain facts. The validated rules artifact contains crop, animal and market parameters, recurring routines, town-model information and policy controls.
+Category
+Meaning
+Examples
+Laws
+Facts defined by the game environment
+Crop timings, prices, market constraints, shed capacity, hiring ladder, $1 price floor
+Chores
+Recurring operational obligations
+Watering, harvesting, planting, feed/care when enabled
+Policy dials
+Intentional strategy parameters
+Crew size, sell floor, capacity, endgame start, drop threshold
+Derived values
+Runtime calculations
+Crop ranking, projected terminal cash, market-adjusted value
+Rule loading follows an explicit provenance path. External sources may be preferred, but mandatory game keys must validate. A rejected external source does not abort the agent if a validated embedded copy is available; the system records which source was actually used.
+Priority values used by the scheduler are read from rules_validated.json (daily_routines section), not hard-coded. This allows tuning without code changes.
+7. Agent Execution Flow
+•  1. Receive observation and configuration.
+•  2. Resolve the validated rules source.
+•  3. Update market, forecast and care state from the current observation.
+•  4. Determine whether endgame policy overrides normal production behaviour.
+•  5. Generate recurring and situational tasks.
+•  6. Skip generating animal-chore tasks entirely while ANIMALS_ENABLED is false (prevention, not post-hoc filtering).
+•  7. Order tasks by urgency band and assign workers using minimum-distance matching within the active band.
+•  8. Build farmer, hired-hand and market action lists as engine-required lists.
+•  9. Emit structurally compliant output by construction — individual actions are lists; market orders are truncated to the engine limit; the return envelope is a dictionary of those lists.
+•  10. Return the action dictionary. On any unexpected exception, return PASS and increment the exception counter.
+8. Scheduler and Task Model
+The scheduler is the operational core. Individual recurring jobs carry a numeric priority, grouped into distinct bands for assignment. Priority values are read from rules_validated.json (daily_routines), not hard-coded. Watering alone spans multiple priority levels so that a plant about to die outranks everything else.
+Critical special case — planting-day watering: A newly planted seed already carries one missed-water mark. If it is not watered on the same day it is planted, it reaches two misses at midnight and becomes a weed. The scheduler must treat newly planted tiles as urgent on the planting turn itself.
+Task
+Priority (higher runs first)
+Water a plant about to die (2nd missed watering)
+9500 — highest
+Harvest a ready animal product (inactive while animals off)
+9100
+Harvest a ready crop
+9000 + crop value
+Feed an animal (inactive while animals off)
+8800
+Water a crop inside its yield-bonus window
+8000
+Water an ongoing crop (tomato / strawberry)
+7000
+Plant a new crop (and water it the same day)
+6000
+Dig out a weed
+5500
+Water a crop with nothing else urgent
+5000
+Collect fertilizer / Care (inactive while animals off)
+3500–4000
+Band note: the table lists ten fixed urgency bands. Harvest runs at 9000 + crop value (outside the fixed set). WATER alone holds four of the fixed bands (9500 / 8000 / 7000 / 5000). This matches the Handover's compute_bands layout.
+Why routine watering sits below planting: a single missed watering is survivable (the plant can still be saved the next day). A missed planting day is lost capacity forever. Only when the plant is at risk of its second missed watering (9500) does watering become the highest priority.
+DROP is triggered when a worker's carried load plus current shed usage exceeds policy.drop_pressure (default 80, against a 100-item shed — 80%, not a range), or during endgame liquidation. The threshold is not fixed: it drops to half the shed under overflow risk and to zero during final liquidation, so it tightens exactly when the cost of a late DROP would be highest. The triggered worker is removed from band assignment entirely for that turn and sent to drop. For the carrying man, a load that would overflow the shed tonight outranks even a dying plant, because a dead plant costs a few units while a spilled load can cost the day's harvest.
+Within a band, workers are matched to tasks using distance-aware assignment (greedy Manhattan). The board has no obstacles requiring BFS; LOCKED tiles are walkable. Routing remains the primary throughput bottleneck: measured at 22% productive work, 25% idle, 53% walking (single-season measurement, seed 42 — recompute before citing as current) — idle time exceeding productive time is itself notable.
+9. Production, Market and Forecasting Design
+9.1 Crop economics
+Crop selection is based on live production economics rather than a fixed crop preference. The model considers production units, expected price, seed cost, cycle length and market state, then ranks crops using a per-tile economic value model.
+9.2 Market model
+Selling decisions use live inventory-sensitive market pricing. The system also considers the agent's own future supply so that planting and liquidation do not assume that today's market conditions remain static. Wheat and eggs are treated as bottomless; premium goods (melon, strawberry, milk, wool) crash sharply and must be sold carefully.
+All market prices have a floor of $1 per unit. Price curves approach this floor rather than reaching zero. At the floor the agent is effectively giving the product away.
+The market is shared with the opponent. Sell prices are evaluated at pre-sale inventory levels. The opponent's sales affect the price the agent receives; this is observed only through the public market inventory, not directly predicted.
+Opponent visibility: the agent can observe the neighbour's money, tile contents, worker positions, and unlocked land. The neighbour's shed, seeds, and market orders are not visible.
+9.3 Forecaster
+The forecaster projects terminal bank from current state and production expectations. It records realised-versus-predicted behaviour and exposes diagnosis information. The current design is a calibrated heuristic, not a full turn-by-turn state-transition replay.
+9.4 Capacity adaptation
+CareMonitor tracks whether the available workforce can sustain the planted acreage. Missed watering contracts the effective production capacity; persistent idle time can justify expansion. Target is zero plants lost to thirst; measured performance is not yet there.
+10. Endgame Design
+Endgame logic overlays the normal scheduler. The governing question is whether an action can still create realizable terminal cash before the season ends. The operating policy uses full-harvest cutoffs (carrot day 26, wheat day 25, melon/strawberry day 19). Wheat and carrot retain a technically possible day-27 one-unit last-gasp option that the present strategy declines.
+The system converts sellable inventory into cash. One hard edge remains: goods that first become sellable on the final playable step may have no subsequent turn for a market action. This is a clock boundary, not a bug.
+11. Reliability and Safety Guardrails
+Guardrail
+Design
+Exception containment
+Public wrapper returns PASS rather than crashing the season.
+Exception accounting
+Every caught exception is counted with runtime context; release fails if any occur in a full season.
+Animal feature guard
+Scheduler excludes animal tasks while ANIMALS_ENABLED is false — prevention, not post-hoc filtering.
+Rules validation
+Mandatory rule data is checked before use; provenance is recorded.
+Action compliance
+Individual commands are lists by construction; overall return is a dict of those lists; audited externally.
+Market limit
+Market actions are capped according to engine constraints before return.
+Engine contract
+List format, stand-on-tile, $1 price floor, and timeout rules are treated as non-negotiable architecture.
+12. Validation and Release Design
+The release workflow separates construction, correctness and performance. A successful build is not itself a successful release.
+•  1. Validate rules and rule provenance against the official engine.
+•  2. Build the submission artifact (refuses to ship if embedded rules disagree with source).
+•  3. Run behavioural revalidation.
+•  4. Run compliance and legality audit.
+•  5. Run automated acceptance/release checks.
+•  6. Confirm zero unexpected swallowed exceptions.
+•  7. Run matched-seed Monte Carlo evaluation for performance-sensitive changes.
+•  8. Update traceability and measured-performance artifacts when the code or evaluation changes.
+Performance acceptance principle
+Performance changes should be evaluated on matched seeds before and after the modification. The release threshold is a policy derived from observed spread and sample size rather than a game law.
+Current release threshold: $35,000 terminal cash. This is calibrated against idle and starter opponents, not self-play. Self-play's worst case is a different measurement (two identical farms splitting one market) and is not the target this bar was meant to clear. The threshold should be recomputed when evaluation variance or season count changes.
+13. Requirement Traceability Design
+The project maintains a 206-item requirement inventory. Each item is classified from inspection of the actual implementation, not merely from the wording of the checklist.
+Status
+Meaning
+Tested
+A specific automated check verifies the behaviour.
+Implemented
+True of the code but not asserted by a dedicated automated check.
+Built, Disabled by Policy
+Working capability intentionally switched off because evaluation did not justify active use.
+Not Implemented
+Capability does not currently exist in executable strategy.
+N/A — different design
+Requirement assumes a mechanism intentionally replaced by another design (e.g. BFS on a board with no obstacles).
+The current traceability mapping is a generated snapshot. Design goal (not yet implemented): surface requirement IDs directly in release output so that a green run reports both check status and coverage.
+14. Current Performance and Operational Constraints
+Measured performance must be treated separately from game rules and code-derived facts. Performance numbers are current only as of their measurement run.
+Observed area
+Current interpretation
+Decision latency
+Comfortably below the engine time limit in measured runs.
+Illegal or useless orders
+Zero in documented audit runs.
+Watering
+Implemented but not yet fully reliable; measured crop-care losses remain (target: zero).
+Endgame inventory
+Usually cleared; final-hour sellability can leave unsold goods.
+Worker utilisation
+Measured at 22% productive work, 25% idle, 53% walking (seed 42, single season); routing remains the primary throughput bottleneck.
+Self-play
+Measured: 7 wins of 20 against an identical agent; mean $37,234; worst $17,747. Consistent with a roughly even matchup within statistical noise.
+Release bar
+$35,000 — calibrated against idle/starter opponents, not self-play.
+15. Known Limitations
+•  Animal automation is not implemented; the full lifecycle (Build → Buy → Pickup → Place → daily Feed + CARE) remains the largest open capability.
+•  Fertilizer: neither path exists. Market purchase (BUY_PRODUCT FERTILIZER) is legal in the engine but has never been attempted by this agent — a gap, not a measured-and-disabled policy choice. Animal-sourced production is not implemented (depends on animals).
+•  Town-demand forecasting and neighbour tracking exist but are disabled by policy after negative measured results (see §16).
+•  Telemetry is in-process only: Forecaster.history, CareMonitor.log, and the exception log capture per-day state for the running episode, but nothing is written to disk or carried between seasons.
+•  Counterfactual branching and detailed forecast-error attribution are incomplete or absent.
+•  Watering reliability is below the target of zero crop losses.
+•  Routing and worker utilisation remain a primary performance bottleneck (measured 22% work / 25% idle / 53% walking).
+•  Traceability exists as a mapping artifact but is not yet emitted dynamically by the release output.
+16. Extension Strategy
+Future work should preserve the current separation of rules, policy and validation. New capabilities should not be considered complete when prose describes them or when a single experiment succeeds. Each extension should pass through implementation, feature gating where appropriate, dedicated behavioural tests, compliance checks, matched-seed evaluation and traceability updates.
+Candidate extension
+Recommended design condition
+Animal subsystem
+Implement complete lifecycle before enabling; retain scheduler feature guard until then.
+Fertilizer
+Animal-sourced path waits on animals. Market purchase has never been attempted — there is no measurement to point to, and none should be implied; write and test it before claiming a result either way.
+Telemetry
+Persist decisions, task selection, movement and exception events for post-season analysis.
+Routing
+Prioritize reduction of walking time (task clustering, territories, multi-step intent) before adding more complex forecasting.
+Traceability automation
+Bind requirement IDs to release checks and report coverage gaps automatically.
+Town-demand forecasting
+Built and measured. Against idle: −$4,037/season (SE $1,369); against starter: −$8,900/season (SE $2,031). Re-enable only after matched-seed evidence shows robust improvement.
+Neighbour tracking
+Built and measured. Harmful in self-play (−$5,534); no effect vs starter. Re-test only against a wider mix of opponents.
+17. Design Summary
+Kaggriculture is designed as a rule-driven autonomous control system rather than a fixed sequence of farming heuristics. The core architecture is intentionally modular: validated rules define the world, runtime models estimate economics and capacity, the scheduler converts obligations and policy into prioritized tasks, and the action emitter produces legal engine commands (lists for individual actions; a dict envelope for the return value). Reliability is enforced through layered validation, feature guards, exception accounting, and an explicit engine contract that includes the $1 price floor, stand-on-tile rule, and overage-time buffer. The system remains deliberately incomplete in several areas, but those boundaries are explicit rather than hidden.
+This document is the architecture companion to the finalized Handover. Where the two differ on operational practice, the Handover is the source of truth for what the farm actually does; this document is the source of truth for how the code is structured to support it.
+Appendix A — Component Responsibility Matrix
+Component
+Owns
+Does not own
+RulesLoader
+Rule source, validation, provenance
+Strategy economics
+MarketModel
+Pricing and crop economics (pure functions)
+Task scheduling
+Forecaster
+Terminal projection and calibration
+Game constants
+CareMonitor
+Care coverage and capacity signals
+Worker movement
+Scheduler
+Task creation, priority and assignment
+Market price equations
+ActionEmitter
+Engine-compatible list action structure
+Strategic ranking
+Validation suite
+Correctness and release evidence
+Production strategy
