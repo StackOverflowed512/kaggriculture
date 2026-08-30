@@ -149,7 +149,8 @@ def test_dying_watering_sorts_to_top(rules, sched):
     tasks = sorted(sched.generate_tasks(obs, rules, care_capacity=100), key=Task.sort_key, reverse=True)
     priorities = [t.priority for t in tasks]
 
-    assert tasks[0].kind == "WATER" and tasks[0].priority == 9500
+    assert tasks[0].kind == "WATER"
+    assert tasks[0].priority == 9500
     assert priorities == sorted(priorities, reverse=True)  # strictly non-increasing
 
 
@@ -232,7 +233,8 @@ def test_just_planted_crop_is_dying_priority(rules, sched):
     }
     tasks = sched.generate_tasks(obs, rules, care_capacity=100)
     water = [t for t in tasks if t.kind == "WATER" and t.pos == (2, 2)]
-    assert water and water[0].priority == 9500
+    assert len(water) > 0
+    assert water[0].priority == 9500
 
 
 # ---------------------------------------------------------------------------
