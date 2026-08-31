@@ -97,7 +97,7 @@ class KaggricultureAgent:
         else:
             get = lambda key, default=None: getattr(obs, key, default)
 
-        board_keys = ("crops", "weeds", "empty_tiles", "workers", "shed", "market_stocks")
+        board_keys = ("crops", "weeds", "empty_tiles", "workers", "shed", "market_stocks", "animals")
         if not any(get(k) is not None for k in board_keys):
             return None
 
@@ -109,6 +109,7 @@ class KaggricultureAgent:
             "workers": get("workers"),  # None -> use persistent model
             "shed": get("shed") or {},
             "market_stocks": get("market_stocks") or {},
+            "animals": get("animals") or [],  # Phase 4: animal lifecycle slots
         }
 
     # ------------------------------------------------------------------ #
