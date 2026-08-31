@@ -63,6 +63,7 @@
     "drop_pressure": 0.8,
     "endgame_start_turn": 670,
     "ANIMALS_ENABLED": false,
+    "FERTILIZER_ENABLED": false,
     "demand_forecast": false
   },
   "ops": {

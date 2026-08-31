@@ -152,6 +152,15 @@ class KaggricultureAgent:
             self._emit_hire(emitter, target_hands)
             self._emit_sells(emitter, shed)
 
+        # Input purchases (fertilizer now; animals in Phase 4 step 2). Placed
+        # every turn outside endgame -- the scheduler's own gates (policy flags,
+        # shed capacity, "not already owned") keep it idempotent, and a home may
+        # finish building at any hour, so we cannot restrict buying to hour 0.
+        # Buying is disabled during endgame, when we only convert stock to cash.
+        if not in_endgame:
+            for order in self.scheduler.generate_market_orders(state, rules, shed_usage=shed_usage):
+                emitter.add_market_order(order)
+
         # Endgame liquidation overlay: phone the broker EVERY turn (not just at
         # hour 0) to convert inventory to cash before the season ends. Buying new
         # land or animals is disabled here (no such purchases are built yet).

@@ -206,6 +206,38 @@ class Scheduler:
         return tasks
 
     # ------------------------------------------------------------------ #
+    # Market order generation (purchases)
+    # ------------------------------------------------------------------ #
+    def generate_market_orders(self, obs, rules, shed_usage=0):
+        """Return the ``BUY_PRODUCT`` market orders to place this turn.
+
+        These are engine ``market`` orders (plain lists), emitted alongside the
+        morning HIRE/SELL routine in ``main.py``. Purchasing is disabled during
+        endgame liquidation (the caller simply does not call us then), so the
+        only concern here is the 100-item shed capacity: bought goods land in
+        the shed, so we never order more than would fit. ``shed_usage`` is the
+        current shed count; we track a running projection as orders accumulate
+        so a batch of buys never overshoots the shed together.
+
+        ``BUY_PRODUCT`` is a single opcode; the item (``"FERTILIZER"``, or an
+        animal type in Phase 4 step 2) is an argument, never a separate op.
+        """
+        policy = rules.get("policy", {})
+        projected_usage = shed_usage
+        orders = []
+
+        # --- Fertilizer -----------------------------------------------------
+        if policy.get("FERTILIZER_ENABLED", False):
+            qty = self._fertilizer_buy_qty(obs, rules, projected_usage)
+            if qty > 0:
+                orders.append(["BUY_PRODUCT", "FERTILIZER", qty])
+                projected_usage += qty
+
+        # --- Animals: populated in Phase 4 step 2 (guarded by ANIMALS_ENABLED)
+
+        return orders
+
+    # ------------------------------------------------------------------ #
     # Worker assignment
     # ------------------------------------------------------------------ #
     def assign_tasks(self, workers, tasks, rules, shed_usage=0, drop_mode=None):
@@ -339,6 +371,37 @@ class Scheduler:
         """
         stock = market_stocks.get(ctype, 0) if market_stocks else 0
         return float(MarketModel.market_price(rules, ctype, stock))
+
+    @staticmethod
+    def _fertilizer_buy_qty(obs, rules, shed_usage):
+        """How many FERTILIZER units to buy this turn (0 = none).
+
+        Fertilizer is worth buying only when standing crops would actually
+        yield more with it (``yield_fertilized > yield_no_fertilizer`` -- true
+        for wheat/carrot, not melon) and we do not already hold enough in the
+        shed. The order is clamped to the free shed slots so a purchase can
+        never push the shed past ``shed_size``: bought fertilizer occupies a
+        shed slot until a worker picks it up to apply.
+        """
+        crops = obs.get("crops") or []
+        shed = obs.get("shed") or {}
+        shed_size = rules["constants"]["shed_size"]
+        crop_params = rules.get("crop_params", {})
+
+        beneficial = 0
+        for crop in crops:
+            params = crop_params.get(crop.get("type"))
+            if not params:
+                continue
+            if params.get("yield_fertilized", 0) > params.get("yield_no_fertilizer", 0):
+                beneficial += 1
+        if beneficial == 0:
+            return 0
+
+        have = shed.get("FERTILIZER", 0) or 0
+        need = max(0, beneficial - have)
+        capacity_left = max(0, shed_size - shed_usage)
+        return min(need, capacity_left)
 
     def _choose_plant_crop(self, rules, step, market_stocks):
         """Best-EV crop that can still be harvested and sold before the season
