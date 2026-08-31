@@ -59,7 +59,8 @@ class Task:
     """A single unit of work the scheduler wants done at a board tile.
 
     Attributes:
-        kind:     one of WATER / HARVEST / PLANT / DIG / FEED / CARE / DROP.
+        kind:     one of WATER / HARVEST / PLANT / DIG / FEED / CARE / DROP, or
+                  an animal-setup verb (BUILD_COOP / BUILD_PASTURE / PLACE).
         pos:      the ``(x, y)`` tile the worker must stand on to act.
         priority: the urgency band value (higher runs first).
         value:    in-band tie-breaker; used for HARVEST as the "+ crop value"
@@ -67,22 +68,32 @@ class Task:
         crop:     crop type -- the argument for a PLANT action, or context.
         same_day: True for the watering task paired with a fresh PLANT (a seed
                   starts one miss from death and must be watered the same day).
+        item:     argument for actions that take one (PICKUP <item>); also the
+                  animal type carried for a PLACE.
+        fetch:    an item that must be picked up from the shed *before* the
+                  worker can perform ``kind`` at ``pos`` (FEED needs "WHEAT", a
+                  PLACE needs the animal). None means "act directly on arrival".
     """
 
-    __slots__ = ("kind", "pos", "priority", "value", "crop", "same_day")
+    __slots__ = ("kind", "pos", "priority", "value", "crop", "same_day", "item", "fetch")
 
-    def __init__(self, kind, pos, priority, value=0.0, crop=None, same_day=False):
+    def __init__(self, kind, pos, priority, value=0.0, crop=None, same_day=False,
+                 item=None, fetch=None):
         self.kind = kind
         self.pos = tuple(pos)
         self.priority = priority
         self.value = value
         self.crop = crop
         self.same_day = same_day
+        self.item = item
+        self.fetch = fetch
 
     def action(self):
         """The engine action list to emit when a worker stands on ``pos``."""
         if self.kind == "PLANT":
             return ["PLANT", self.crop]
+        if self.kind == "PICKUP":
+            return ["PICKUP", self.item]
         return [self.kind]
 
     def sort_key(self):
@@ -92,7 +103,8 @@ class Task:
     def __repr__(self):
         return (
             f"Task({self.kind}, pos={self.pos}, pri={self.priority}, "
-            f"val={self.value}, crop={self.crop}, same_day={self.same_day})"
+            f"val={self.value}, crop={self.crop}, same_day={self.same_day}, "
+            f"item={self.item}, fetch={self.fetch})"
         )
 
     def __eq__(self, other):
@@ -105,6 +117,8 @@ class Task:
             and self.value == other.value
             and self.crop == other.crop
             and self.same_day == other.same_day
+            and self.item == other.item
+            and self.fetch == other.fetch
         )
 
 
@@ -199,9 +213,84 @@ class Scheduler:
 
         # --- Animal chores are skipped entirely while animals are disabled ---
         # (Prevention, not post-hoc filtering -- see design doc guardrails.)
-        # Phase 4 will populate HARVEST_ANIMAL (9100), FEED (8800) and CARE here.
-        if animals_on:  # pragma: no cover - Phase 4 placeholder
-            pass
+        # When enabled, _animal_tasks walks each animal's lifecycle stage and
+        # emits HARVEST_ANIMAL (9100), FEED (8800), CARE (4000), plus the setup
+        # BUILD_* / PLACE work.
+        if animals_on:
+            tasks.extend(self._animal_tasks(obs, rules))
+
+        return tasks
+
+    def _animal_tasks(self, obs, rules):
+        """Build the animal-lifecycle tasks for this turn.
+
+        Driven entirely by ``obs["animals"]`` -- one dict per animal slot the
+        agent operates, mirroring how crops/weeds/empty_tiles drive crop work.
+        Recognised per-animal fields (all optional, sensible defaults):
+            type:        animal key into ``animal_params`` (GOOSE/COW/SHEEP).
+            home_pos:    the ``(x, y)`` tile of its home (build + act target).
+            home_built:  the COOP/PASTURE structure exists.
+            owned:       we have bought it (it is in the shed or already placed).
+            placed:      it is standing in its home and producing.
+            fed_today:   it has been fed this day (miss 2 days -> it escapes).
+            ready:       a product (egg/milk/wool) is ready to HARVEST.
+            needs_care:  a CARE productivity bonus is available to bank.
+
+        Each animal contributes only the task(s) matching its current stage of
+        Build home -> Buy -> Pickup+Place -> daily Feed + Care -> Harvest.
+        Buying is a market order (see generate_market_orders); the rest is
+        worker work routed through the normal band matching.
+        """
+        dr = rules["daily_routines"]
+        animal_params = rules.get("animal_params", {})
+        animals = obs.get("animals") or []
+        market_stocks = obs.get("market_stocks") or {}
+        tasks = []
+
+        for animal in animals:
+            atype = animal.get("type")
+            params = animal_params.get(atype)
+            if not params or animal.get("home_pos") is None:
+                continue
+            home = tuple(animal["home_pos"])
+
+            # Stage 1: build the home (COOP for geese, PASTURE for cows/sheep).
+            if not animal.get("home_built", False):
+                build_kind = self._build_action(params.get("home"))
+                if build_kind is not None:
+                    tasks.append(Task(build_kind, home, dr["BUILD_HOME"]["priority"], crop=atype))
+                continue
+
+            # Stage 2: transport a bought-but-unplaced animal. The worker fetches
+            # it from the shed (PICKUP), carries it, and PLACEs it on the home.
+            if animal.get("owned", False) and not animal.get("placed", False):
+                tasks.append(
+                    Task("PLACE", home, dr["PLACE_ANIMAL"]["priority"],
+                         crop=atype, item=atype, fetch=atype)
+                )
+                continue
+
+            if not animal.get("placed", False):
+                continue
+
+            # Stage 3: a placed animal earns its keep. Bands order these:
+            # harvest (9100) > feed (8800) > care (4000).
+            if animal.get("ready", False):
+                product = params.get("produces")
+                tasks.append(
+                    Task(
+                        "HARVEST",
+                        home,
+                        dr["HARVEST_ANIMAL"]["priority"],
+                        value=self._crop_value(rules, product, market_stocks),
+                        crop=atype,
+                    )
+                )
+            if not animal.get("fed_today", False):
+                # Feeding needs one wheat carried from the shed first.
+                tasks.append(Task("FEED", home, dr["FEED"]["priority"], crop=atype, fetch="WHEAT"))
+            if animal.get("needs_care", False):
+                tasks.append(Task("CARE", home, dr["CARE"]["priority"], crop=atype))
 
         return tasks
 
@@ -233,7 +322,21 @@ class Scheduler:
                 orders.append(["BUY_PRODUCT", "FERTILIZER", qty])
                 projected_usage += qty
 
-        # --- Animals: populated in Phase 4 step 2 (guarded by ANIMALS_ENABLED)
+        # --- Animals: buy an animal once its home is built and it is not yet
+        # owned. A bought animal arrives in the shed, so it takes one shed slot
+        # until a worker carries it out to its home -- respect capacity.
+        if policy.get("ANIMALS_ENABLED", False):
+            shed_size = rules["constants"]["shed_size"]
+            animal_params = rules.get("animal_params", {})
+            for animal in (obs.get("animals") or []):
+                atype = animal.get("type")
+                if atype not in animal_params:
+                    continue
+                if (animal.get("home_built", False)
+                        and not animal.get("owned", False)
+                        and projected_usage + 1 <= shed_size):
+                    orders.append(["BUY_PRODUCT", atype])
+                    projected_usage += 1
 
         return orders
 
@@ -263,7 +366,11 @@ class Scheduler:
         for worker in workers:
             pos = tuple(worker["pos"])
             carried = worker.get("carried", 0)
-            if carried > 0 and (carried + shed_usage) > threshold:
+            # A worker fetching/transporting a task item (wheat for FEED, an
+            # animal for PLACE) must not be diverted to DROP -- that would dump
+            # the very item it just picked up. Only loose harvest triggers DROP.
+            if (carried > 0 and not worker.get("carrying_item")
+                    and (carried + shed_usage) > threshold):
                 actions[worker["id"]] = self._shed_action(pos)
             else:
                 free.append(worker)
@@ -318,6 +425,12 @@ class Scheduler:
         pos = tuple(worker["pos"])
         if task.kind == "DROP":
             return self._shed_action(pos)
+        # Fetch step: FEED/PLACE need an item carried from the shed first. Route
+        # the worker to a shed tile and PICKUP before heading to the work tile.
+        if task.fetch and worker.get("carrying_item") != task.fetch:
+            if pos in SHED_TILES:
+                return ["PICKUP", task.fetch]
+            return step_towards(pos, nearest_shed_tile(pos))
         if pos == task.pos:
             return task.action()
         return step_towards(pos, task.pos)
@@ -339,6 +452,16 @@ class Scheduler:
             return bool(flagged)
         params = rules.get("crop_params", {}).get(ctype)
         return bool(params) and params.get("type") == "repeater"
+
+    @staticmethod
+    def _build_action(home_type):
+        """Map an animal's home type to the BUILD verb that raises it.
+
+        GOOSE lives in a COOP (``BUILD_COOP``); COW/SHEEP share a PASTURE
+        (``BUILD_PASTURE``). Returns None for an unknown home type so an
+        unrecognised animal simply produces no build task.
+        """
+        return {"COOP": "BUILD_COOP", "PASTURE": "BUILD_PASTURE"}.get(home_type)
 
     @staticmethod
     def _water_priority(crop, water_bands, to_die, is_repeater):

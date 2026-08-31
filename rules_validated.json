@@ -56,6 +56,8 @@
     "FEED": { "priority": 8800 },
     "PLANT": { "priority": 6000 },
     "DIG": { "priority": 5500 },
+    "PLACE_ANIMAL": { "priority": 4800 },
+    "BUILD_HOME": { "priority": 4600 },
     "CARE": { "priority": 4000 }
   },
   "policy": {
