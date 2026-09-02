@@ -23,6 +23,8 @@ Coordinate convention (documented and self-consistent):
 """
 
 from market_model import MarketModel
+import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 # The four centre tiles that give access to the shed (DROP / PICKUP).
 SHED_TILES = ((4, 4), (5, 4), (4, 5), (5, 5))
@@ -397,25 +399,32 @@ class Scheduler:
         return actions
 
     def _match_band(self, free, band, actions):
-        """Greedily assign the closest (worker, task) pairs within one band.
+        """Assign workers to tasks within one band to minimize total walking distance.
 
-        Repeatedly picks the globally nearest worker/task pair in the band and
-        commits it, so total walking inside the band is kept low. Mutates
-        ``free`` (removing assigned workers) and ``actions``.
+        Uses the Hungarian algorithm (via scipy.optimize.linear_sum_assignment)
+        to find the globally optimal bipartite matching between available workers
+        and tasks in this urgency band. Mutates ``free`` (removing assigned
+        workers) and ``actions``.
         """
-        band_tasks = list(band)
-        while free and band_tasks:
-            best = None  # (distance, worker_index, task_index)
-            for wi, worker in enumerate(free):
-                wpos = tuple(worker["pos"])
-                for ti, task in enumerate(band_tasks):
-                    dist = manhattan(wpos, task.pos)
-                    if best is None or dist < best[0]:
-                        best = (dist, wi, ti)
-            _, wi, ti = best
-            worker = free.pop(wi)
-            task = band_tasks.pop(ti)
+        if not free or not band:
+            return
+
+        cost_matrix = np.zeros((len(free), len(band)))
+        for i, worker in enumerate(free):
+            wpos = tuple(worker["pos"])
+            for j, task in enumerate(band):
+                cost_matrix[i, j] = manhattan(wpos, task.pos)
+
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+        assigned_workers = set()
+        for i, j in zip(row_ind, col_ind):
+            worker = free[i]
+            task = band[j]
             actions[worker["id"]] = self._task_action(worker, task)
+            assigned_workers.add(worker["id"])
+
+        free[:] = [w for w in free if w["id"] not in assigned_workers]
 
     # ------------------------------------------------------------------ #
     # Action helpers
