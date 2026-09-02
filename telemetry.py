@@ -1,4 +1,7 @@
 import traceback
+import json
+import os
+from datetime import datetime
 
 class Telemetry:
     def __init__(self):
@@ -16,3 +19,16 @@ class Telemetry:
 
     def get_exception_count(self) -> int:
         return self.exception_count
+
+    def flush_to_disk(self):
+        """Flushes telemetry data to disk safely."""
+        try:
+            filename = f"telemetry_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            data = {
+                "exception_count": self.exception_count,
+                "exceptions_log": self.exceptions_log
+            }
+            with open(filename, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass

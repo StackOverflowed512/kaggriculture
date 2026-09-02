@@ -70,11 +70,14 @@ class KaggricultureAgent:
                 return emitter.emit()
 
             self._run_operations(state, step, emitter)
+            if step == 719:
+                self.telemetry.flush_to_disk()
             return emitter.emit()
 
         except Exception as e:
             # Exception containment: never crash the season
             self.telemetry.record_exception(step, e)
+            self.telemetry.flush_to_disk()
 
             # Degrade gracefully to PASS
             return {
