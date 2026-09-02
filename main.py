@@ -37,7 +37,7 @@ class KaggricultureAgent:
         # The permanent farmer is always present; hired hands are (re)created
         # each morning and dead-reckoned between turns when the observation does
         # not report positions directly.
-        self.workers = {"farmer": {"pos": self.HOME, "carried": 0}}
+        self.workers = {"farmer": {"pos": self.HOME, "carried": 0, "carrying_item": None}}
 
     def __call__(self, obs, config):
         step = obs.step if hasattr(obs, 'step') else obs.get('step', 0)
@@ -97,7 +97,7 @@ class KaggricultureAgent:
         else:
             get = lambda key, default=None: getattr(obs, key, default)
 
-        board_keys = ("crops", "weeds", "empty_tiles", "workers", "shed", "market_stocks")
+        board_keys = ("crops", "weeds", "empty_tiles", "workers", "shed", "market_stocks", "animals")
         if not any(get(k) is not None for k in board_keys):
             return None
 
@@ -109,6 +109,7 @@ class KaggricultureAgent:
             "workers": get("workers"),  # None -> use persistent model
             "shed": get("shed") or {},
             "market_stocks": get("market_stocks") or {},
+            "animals": get("animals") or [],  # Phase 4: animal lifecycle slots
         }
 
     # ------------------------------------------------------------------ #
@@ -152,6 +153,15 @@ class KaggricultureAgent:
             self._emit_hire(emitter, target_hands)
             self._emit_sells(emitter, shed)
 
+        # Input purchases (fertilizer now; animals in Phase 4 step 2). Placed
+        # every turn outside endgame -- the scheduler's own gates (policy flags,
+        # shed capacity, "not already owned") keep it idempotent, and a home may
+        # finish building at any hour, so we cannot restrict buying to hour 0.
+        # Buying is disabled during endgame, when we only convert stock to cash.
+        if not in_endgame:
+            for order in self.scheduler.generate_market_orders(state, rules, shed_usage=shed_usage):
+                emitter.add_market_order(order)
+
         # Endgame liquidation overlay: phone the broker EVERY turn (not just at
         # hour 0) to convert inventory to cash before the season ends. Buying new
         # land or animals is disabled here (no such purchases are built yet).
@@ -186,17 +196,18 @@ class KaggricultureAgent:
                 roster[w["id"]] = {
                     "pos": tuple(w["pos"]),
                     "carried": w.get("carried", 0),
+                    "carrying_item": w.get("carrying_item"),
                 }
-            roster.setdefault("farmer", {"pos": self.HOME, "carried": 0})
+            roster.setdefault("farmer", {"pos": self.HOME, "carried": 0, "carrying_item": None})
             self.workers = roster
             return
 
         # Persistent local model: the farmer is permanent; the hired hands go
         # home at midnight, so we (re)create them at hour 0 up to target_hands.
-        self.workers.setdefault("farmer", {"pos": self.HOME, "carried": 0})
+        self.workers.setdefault("farmer", {"pos": self.HOME, "carried": 0, "carrying_item": None})
         if hour == 0:
             for i in range(target_hands):
-                self.workers.setdefault(f"hand_{i}", {"pos": self.HOME, "carried": 0})
+                self.workers.setdefault(f"hand_{i}", {"pos": self.HOME, "carried": 0, "carrying_item": None})
 
     def _workers_list(self):
         """Roster as a list of dicts, farmer first then hands in index order."""
@@ -213,7 +224,12 @@ class KaggricultureAgent:
         result = []
         for wid in sorted(self.workers, key=order):
             w = self.workers[wid]
-            result.append({"id": wid, "pos": tuple(w["pos"]), "carried": w.get("carried", 0)})
+            result.append({
+                "id": wid,
+                "pos": tuple(w["pos"]),
+                "carried": w.get("carried", 0),
+                "carrying_item": w.get("carrying_item"),
+            })
         return result
 
     def _advance_positions(self, state, actions):
@@ -235,6 +251,15 @@ class KaggricultureAgent:
                 worker["pos"] = (x + dx, y + dy)
             elif verb == "DROP":
                 worker["carried"] = 0
+                worker["carrying_item"] = None
+            elif verb == "PICKUP":
+                # Fetching a specific item from the shed (wheat, an animal).
+                worker["carried"] = worker.get("carried", 0) + 1
+                worker["carrying_item"] = action[1] if len(action) > 1 else None
+            elif verb in ("PLACE", "FEED"):
+                # The carried item is consumed onto the tile (placed / fed).
+                worker["carried"] = max(0, worker.get("carried", 0) - 1)
+                worker["carrying_item"] = None
             elif verb == "HARVEST":
                 worker["carried"] += 1
 
