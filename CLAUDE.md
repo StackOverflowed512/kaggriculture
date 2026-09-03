@@ -34,7 +34,7 @@ The workspace is organized as a modular Python package:
 
 ```
 ├── rules_validated.json   # Game constants, crop rules, dials, priorities
-├── rules_loader.py        # Loads and validates JSON rules (verifies 12 mandatory keys)
+├── rules_loader.py        # Loads and validates JSON rules (verifies 9 mandatory keys)
 ├── action_emitter.py      # Formats and wraps engine-compliant action outputs
 ├── telemetry.py           # In-memory logger tracking caught exception hour logs
 ├── market_model.py        # Stateless pricing math (linear, sq, sqrt, log) and crop EV ranking

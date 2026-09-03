@@ -30,7 +30,7 @@ The project is built as a highly decoupled, modular system of components that pa
     *   Tracks worker positions, daily hiring, and morning sales.
 2.  **Rules Loader (`rules_loader.py` & `rules_validated.json`)**: 
     *   Validates and parses the external configuration rulebook containing game laws, dials, priorities, and constants. 
-    *   Verifies 12 mandatory constants before loading, reverting to embedded defaults if the external file is corrupted or missing keys.
+    *   Verifies 9 mandatory constants before loading. It resolves the rules file across a provenance chain (explicit path, the agent's own directory, then the working directory) and falls back to an embedded copy of the rule table if the file cannot be located anywhere, so a missing file degrades to playing on defaults rather than passing the whole season.
 3.  **Action Emitter (`action_emitter.py`)**: 
     *   Enforces the list structure for all commands and truncates market orders to the 10-call hourly limit.
 4.  **Telemetry (`telemetry.py`)**: 

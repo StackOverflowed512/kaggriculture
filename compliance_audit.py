@@ -166,39 +166,31 @@ def default_season():
 def _simulate_turn(sched, obs, rules):
     """Mirror main.py's per-turn decisions and return (worker rows, market orders).
 
-    Market orders are pushed through the *real* ``ActionEmitter`` in main.py's
-    own hire -> sell -> buy order, so the audit sees the same capped bucket the
-    engine would (re-deriving the cap here would risk drifting from the agent).
-    worker rows are ``(worker_id, pos, action)``; positions come from the
-    observation so the semantic audit knows exactly where each action lands.
+    Market orders come from the *shared* ``Scheduler.daily_market_orders`` helper
+    -- the same one main.py emits from -- pushed through the real
+    ``ActionEmitter`` so the audit sees the identical capped bucket the engine
+    would, with no re-implemented ladder to drift from the agent. worker rows are
+    ``(worker_id, pos, action)``; positions come from the observation so the
+    semantic audit knows exactly where each action lands.
     """
     shed = obs.get("shed") or {}
     shed_usage = sum(v for v in shed.values() if v)
-    hour = obs.get("step", 0) % 24
-    in_endgame = obs.get("step", 0) >= rules["policy"].get("endgame_start_turn", 670)
-    drop_mode = "endgame" if in_endgame else ("overflow" if hour == 23 else "normal")
+    hours_per_day = rules["constants"].get("hours_per_day", 24)
+    step = obs.get("step", 0)
+    hour = step % hours_per_day
+    in_endgame = step >= rules["policy"].get("endgame_start_turn", 670)
+    drop_mode = "endgame" if in_endgame else ("overflow" if hour == hours_per_day - 1 else "normal")
 
     tasks = sched.generate_tasks(obs, rules, care_capacity=100,
                                  market_stocks=obs.get("market_stocks"))
     workers = obs.get("workers") or []
     actions = sched.assign_tasks(workers, tasks, rules, shed_usage=shed_usage, drop_mode=drop_mode)
     pos_by_id = {w["id"]: tuple(w["pos"]) for w in workers}
-    rows = [(wid, pos_by_id.get(wid, (4, 4)), act) for wid, act in actions.items()]
+    rows = [(wid, pos_by_id.get(wid, SHED_TILES[0]), act) for wid, act in actions.items()]
 
     emitter = ActionEmitter(max_market_orders=rules["constants"]["max_market_orders"])
-    if hour == 0:
-        for _ in range(rules["policy"].get("target_hands", 10)):
-            emitter.add_market_order(["HIRE"])
-        for item, qty in shed.items():
-            if qty and qty > 0:
-                emitter.add_market_order(["SELL", item, int(qty)])
-    if not in_endgame:
-        for order in sched.generate_market_orders(obs, rules, shed_usage=shed_usage):
-            emitter.add_market_order(order)
-    elif hour != 0:
-        for item, qty in shed.items():
-            if qty and qty > 0:
-                emitter.add_market_order(["SELL", item, int(qty)])
+    for order in sched.daily_market_orders(obs, rules, hour, in_endgame, shed_usage=shed_usage):
+        emitter.add_market_order(order)
     return rows, emitter.emit()["market"]
 
 

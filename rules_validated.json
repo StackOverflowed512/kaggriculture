@@ -11,6 +11,7 @@
     "hiring_ladder": [1, 1, 2, 3, 5, 8, 13, 21, 34, 55],
     "missed_waterings_to_die": 2,
     "price_floor": 1,
+    "hours_per_day": 24,
     "MIN_TERMINAL_TARGET": 35000,
     "CORRECTION_THRESHOLD": 45000
   },
@@ -22,8 +23,8 @@
     "STRAWBERRY": { "seed": 100, "first_fruit": 10, "fruit_every": 2, "max_fruits": 4, "type": "repeater" }
   },
   "market_params": {
-    "WHEAT": { "normal_price": 25, "curve": "log", "halves_after": -1, "hits_floor_after": -1 },
-    "EGG": { "normal_price": 50, "curve": "log", "halves_after": -1, "hits_floor_after": -1 },
+    "WHEAT": { "normal_price": 25, "curve": "log", "halves_after": -1, "hits_floor_after": -1, "log_decay": 0.0315 },
+    "EGG": { "normal_price": 50, "curve": "log", "halves_after": -1, "hits_floor_after": -1, "log_decay": 0.0315 },
     "CARROT": { "normal_price": 35, "curve": "sqrt", "halves_after": 230, "hits_floor_after": 842 },
     "TOMATO": { "normal_price": 60, "curve": "sqrt", "halves_after": 135, "hits_floor_after": 529 },
     "MELON": { "normal_price": 250, "curve": "sq", "halves_after": 112, "hits_floor_after": 158 },

@@ -1,2 +1,6 @@
 __pycache__/
 submission.tar.gz
+
+# Run artifacts written by the agent / release tooling
+telemetry_run_*.json
+traceability_report.md

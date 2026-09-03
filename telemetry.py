@@ -1,7 +1,10 @@
 import traceback
 import json
-import os
-from datetime import datetime
+
+# Single, fixed run-log filename. The agent flushes telemetry on every caught
+# exception and at the season end; a fixed name overwrites one file in place
+# instead of littering the working directory with a timestamped file per flush.
+TELEMETRY_FILENAME = "telemetry_run_latest.json"
 
 class Telemetry:
     def __init__(self):
@@ -21,14 +24,13 @@ class Telemetry:
         return self.exception_count
 
     def flush_to_disk(self):
-        """Flushes telemetry data to disk safely."""
+        """Flushes telemetry data to disk safely (overwriting the prior run log)."""
         try:
-            filename = f"telemetry_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
             data = {
                 "exception_count": self.exception_count,
                 "exceptions_log": self.exceptions_log
             }
-            with open(filename, "w") as f:
+            with open(TELEMETRY_FILENAME, "w") as f:
                 json.dump(data, f, indent=2)
         except Exception:
             pass

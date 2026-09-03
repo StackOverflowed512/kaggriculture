@@ -6,21 +6,23 @@ class MarketModel:
     """
     
     @staticmethod
-    def _shape(curve_type: str, normal_price: float, halves_after: float, current_stock: int) -> float:
+    def _shape(curve_type: str, normal_price: float, halves_after: float,
+               current_stock: int, log_decay: float = 0.0315) -> float:
         if current_stock <= 0:
             return normal_price
-            
+
         if halves_after <= 0:
             # For 'never' halving curves like log for Wheat and Egg
             if curve_type == 'log':
-                # Approximation: $25 -> $19 at 2000 units.
-                # Let's use a very slow decay curve: P = P0 * (1 - c * log(1 + Q))
-                # For Wheat: 25 * (1 - c * log(2001)) = 19 => c * 7.6 = 6/25 => c ~ 0.0315
-                return normal_price * (1 - 0.0315 * math.log(1 + current_stock))
+                # Slow decay curve: P = P0 * (1 - c * log(1 + Q)), where the
+                # coefficient ``c`` (``log_decay``) is tuned in the rule table,
+                # not hard-coded. For Wheat (c=0.0315): 25 * (1 - c * log(2001))
+                # ~= 19 at 2000 units.
+                return normal_price * (1 - log_decay * math.log(1 + current_stock))
             return normal_price
-            
+
         ratio = current_stock / halves_after
-        
+
         if curve_type == 'linear':
             factor = 1 - 0.5 * ratio
         elif curve_type == 'sq':
@@ -32,7 +34,7 @@ class MarketModel:
             factor = 1 - 0.5 * (math.log(1 + current_stock) / math.log(1 + halves_after))
         else:
             factor = 1 - 0.5 * ratio # default linear
-            
+
         return normal_price * factor
 
     @staticmethod
@@ -41,18 +43,29 @@ class MarketModel:
         Computes the live price of an item given the current market inventory,
         enforcing the $1 price floor.
         """
+        floor = rules.get("constants", {}).get("price_floor", 1)
         params = rules["market_params"].get(item)
         if not params:
-            return 1 # unknown items default to floor
-            
+            return int(floor)  # unknown items default to the floor
+
+        # ``hits_floor_after`` (from the rule table) is the stock level at which
+        # a curve is defined to bottom out at the floor. Honour it explicitly so
+        # every curve type agrees with the documented floor point instead of
+        # each shape's own asymptote (e.g. the sqrt curves otherwise never quite
+        # reach $1 at their stated stock).
+        floor_after = params.get("hits_floor_after", -1)
+        if isinstance(floor_after, (int, float)) and floor_after > 0 and current_stock >= floor_after:
+            return int(floor)
+
         raw_price = MarketModel._shape(
             curve_type=params["curve"],
             normal_price=params["normal_price"],
             halves_after=params["halves_after"],
-            current_stock=current_stock
+            current_stock=current_stock,
+            log_decay=params.get("log_decay", 0.0315),
         )
-        
-        return max(1, int(round(raw_price)))
+
+        return max(int(floor), int(round(raw_price)))
 
     @staticmethod
     def avg_price(rules: dict, item: str, current_stock: int, qty: int) -> float:
