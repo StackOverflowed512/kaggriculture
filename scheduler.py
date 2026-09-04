@@ -23,8 +23,6 @@ Coordinate convention (documented and self-consistent):
 """
 
 from market_model import MarketModel
-import numpy as np
-from scipy.optimize import linear_sum_assignment
 
 # The four centre tiles that give access to the shed (DROP / PICKUP).
 SHED_TILES = ((4, 4), (5, 4), (4, 5), (5, 5))
@@ -342,6 +340,39 @@ class Scheduler:
 
         return orders
 
+    @staticmethod
+    def _sell_orders(shed):
+        """A SELL order for every shed item that holds positive stock."""
+        return [["SELL", item, int(qty)] for item, qty in (shed or {}).items()
+                if qty and qty > 0]
+
+    def daily_market_orders(self, state, rules, hour, in_endgame, shed_usage=0):
+        """The full ordered market plan for one turn.
+
+        Encodes the handover's morning-then-overlay ladder in one place so both
+        the live agent (``main.py``) and the offline compliance audit emit an
+        identical bucket (they previously duplicated this and could drift):
+            * hour 0        -> HIRE the crew up to ``target_hands``, then SELL the
+                               shed inventory.
+            * not endgame   -> input purchases (fertilizer / animals) from
+                               ``generate_market_orders``.
+            * endgame, h!=0 -> liquidate the shed every remaining turn.
+        Orders are returned uncapped; the ``ActionEmitter`` applies the 10-order
+        engine cap at emission.
+        """
+        policy = rules.get("policy", {})
+        shed = state.get("shed") or {}
+        orders = []
+        if hour == 0:
+            for _ in range(policy.get("target_hands", 10)):
+                orders.append(["HIRE"])
+            orders.extend(self._sell_orders(shed))
+        if not in_endgame:
+            orders.extend(self.generate_market_orders(state, rules, shed_usage=shed_usage))
+        elif hour != 0:
+            orders.extend(self._sell_orders(shed))
+        return orders
+
     # ------------------------------------------------------------------ #
     # Worker assignment
     # ------------------------------------------------------------------ #
@@ -399,32 +430,41 @@ class Scheduler:
         return actions
 
     def _match_band(self, free, band, actions):
-        """Assign workers to tasks within one band to minimize total walking distance.
+        """Assign workers to tasks within one band by greedy Manhattan distance.
 
-        Uses the Hungarian algorithm (via scipy.optimize.linear_sum_assignment)
-        to find the globally optimal bipartite matching between available workers
-        and tasks in this urgency band. Mutates ``free`` (removing assigned
-        workers) and ``actions``.
+        Repeatedly takes the globally closest remaining worker-task pair, assigns
+        it, and drops both from consideration, until one side is exhausted. This
+        is the greedy minimum-distance matching the design doc specifies; it
+        needs no third-party solver (so the agent has no scipy/numpy import to
+        fail on in the Kaggle image). Ties break deterministically by worker
+        index then task index, so routing is fully reproducible. Mutates
+        ``free`` (removing assigned workers) and ``actions``.
         """
         if not free or not band:
             return
 
-        cost_matrix = np.zeros((len(free), len(band)))
-        for i, worker in enumerate(free):
+        # All (distance, worker_index, task_index) pairs, ascending: closest and
+        # (on ties) lowest-index pairs are consumed first -> deterministic.
+        pairs = []
+        for wi, worker in enumerate(free):
             wpos = tuple(worker["pos"])
-            for j, task in enumerate(band):
-                cost_matrix[i, j] = manhattan(wpos, task.pos)
+            for ti, task in enumerate(band):
+                pairs.append((manhattan(wpos, task.pos), wi, ti))
+        pairs.sort()
 
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        used_workers = set()
+        used_tasks = set()
+        for _dist, wi, ti in pairs:
+            if wi in used_workers or ti in used_tasks:
+                continue
+            worker = free[wi]
+            actions[worker["id"]] = self._task_action(worker, band[ti])
+            used_workers.add(wi)
+            used_tasks.add(ti)
+            if len(used_workers) == len(free) or len(used_tasks) == len(band):
+                break
 
-        assigned_workers = set()
-        for i, j in zip(row_ind, col_ind):
-            worker = free[i]
-            task = band[j]
-            actions[worker["id"]] = self._task_action(worker, task)
-            assigned_workers.add(worker["id"])
-
-        free[:] = [w for w in free if w["id"] not in assigned_workers]
+        free[:] = [w for i, w in enumerate(free) if i not in used_workers]
 
     # ------------------------------------------------------------------ #
     # Action helpers
@@ -552,8 +592,9 @@ class Scheduler:
         params = rules.get("crop_params", {}).get(ctype)
         if not params:
             return False
-        season_days = rules["constants"]["season_length"] // 24
-        day = step // 24
+        hours_per_day = rules["constants"].get("hours_per_day", 24)
+        season_days = rules["constants"]["season_length"] // hours_per_day
+        day = step // hours_per_day
         if params.get("type") == "repeater":
             grow_days = params.get("first_fruit", season_days)
         else:

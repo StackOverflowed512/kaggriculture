@@ -44,6 +44,8 @@ EXPECTED_BAND_ORDER = (
     ("PLANT", "priority"),
     ("DIG", "priority"),
     ("WATER", "priority_normal"),
+    ("PLACE_ANIMAL", "priority"),
+    ("BUILD_HOME", "priority"),
     ("CARE", "priority"),
 )
 

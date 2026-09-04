@@ -9,13 +9,15 @@ from telemetry import Telemetry
 from market_model import MarketModel
 from care_monitor import CareMonitor
 from forecaster import Forecaster
-from scheduler import Scheduler
+from scheduler import Scheduler, SHED_TILES
 
 
 class KaggricultureAgent:
     # Where a worker starts / returns to when we have no observed position.
-    # A central tile keeps early walking short; live games overwrite this from obs.
-    HOME = (4, 4)
+    # The shed's first centre tile keeps early walking short (it is where drops
+    # happen) and ties the default to the single SHED_TILES source; live games
+    # overwrite this from obs.
+    HOME = SHED_TILES[0]
 
     # Coordinate deltas for dead-reckoning persistent worker positions between
     # turns (see scheduler.py for the (x, y) / NORTH-SOUTH-EAST-WEST convention).
@@ -47,19 +49,13 @@ class KaggricultureAgent:
             if self.rules is None:
                 self.rules = self.rules_loader.load_rules()
 
-            # Initialize ActionEmitter for the current turn
-            max_orders = self.rules["constants"]["max_market_orders"]
-            emitter = ActionEmitter(max_market_orders=max_orders)
+            constants = self.rules["constants"]
+            hours_per_day = constants.get("hours_per_day", 24)
+            season_length = constants.get("season_length", 720)
 
-            # Phase 2 Integration: end-of-day monitoring update.
-            # Realized/missed values are still mocked here; wiring them to real
-            # observation deltas is future work and does not affect emission.
-            if step > 0 and step % 24 == 0:
-                day = step // 24
-                self.care_monitor.observe_day(day, 0)
-                realized_money = 1000
-                projected_yesterday = self.forecaster.last_prediction or 1000
-                self.forecaster.observe(day, realized_money, projected_yesterday)
+            # Initialize ActionEmitter for the current turn
+            max_orders = constants["max_market_orders"]
+            emitter = ActionEmitter(max_market_orders=max_orders)
 
             # Phase 3: run the operational core only when the observation carries
             # board state. A bare observation (no crops/weeds/workers/etc.) leaves
@@ -69,8 +65,31 @@ class KaggricultureAgent:
                 emitter.set_farmer_action([])
                 return emitter.emit()
 
+            # End-of-day monitoring update, driven by real observation signals
+            # where the engine reports them. Missed-watering count feeds the
+            # CareMonitor's acreage control; realized cash calibrates yesterday's
+            # forecast. Absent fields default to no-ops so the monitors stay
+            # dormant rather than acting on mocked numbers.
+            if step > 0 and step % hours_per_day == 0:
+                day = step // hours_per_day
+                self.care_monitor.observe_day(day, state.get("missed_waterings", 0) or 0)
+                realized_money = state.get("money")
+                projected_yesterday = self.forecaster.last_prediction
+                if realized_money is not None and projected_yesterday:
+                    self.forecaster.observe(day, realized_money, projected_yesterday)
+
             self._run_operations(state, step, emitter)
-            if step == 719:
+
+            # Refresh the terminal-cash projection for tomorrow's calibration,
+            # but only when the observation actually reports current cash.
+            money = state.get("money")
+            if money is not None:
+                self.forecaster.project(
+                    self.rules, money, state["shed"], state["crops"],
+                    state["market_stocks"],
+                )
+
+            if step == season_length - 1:
                 self.telemetry.flush_to_disk()
             return emitter.emit()
 
@@ -104,6 +123,13 @@ class KaggricultureAgent:
         if not any(get(k) is not None for k in board_keys):
             return None
 
+        # Current cash may be reported as "money" or "cash"; keep it as None when
+        # absent (distinct from a real $0) so the forecaster only calibrates on
+        # genuine readings.
+        money = get("money")
+        if money is None:
+            money = get("cash")
+
         return {
             "step": get("step", 0) or 0,
             "crops": get("crops") or [],
@@ -113,6 +139,8 @@ class KaggricultureAgent:
             "shed": get("shed") or {},
             "market_stocks": get("market_stocks") or {},
             "animals": get("animals") or [],  # Phase 4: animal lifecycle slots
+            "money": money,  # None when the observation does not report cash
+            "missed_waterings": get("missed_waterings", 0) or 0,
         }
 
     # ------------------------------------------------------------------ #
@@ -124,7 +152,8 @@ class KaggricultureAgent:
         policy = rules["policy"]
         constants = rules["constants"]
 
-        hour = step % 24
+        hours_per_day = constants.get("hours_per_day", 24)
+        hour = step % hours_per_day
         endgame_start = policy.get("endgame_start_turn", 670)
         target_hands = policy.get("target_hands", 10)
         drop_pressure = policy.get("drop_pressure", 0.8)
@@ -141,7 +170,7 @@ class KaggricultureAgent:
         #   normal   -> the standard 80% threshold
         if in_endgame:
             self.scheduler.drop_mode = "endgame"
-        elif hour == 23 or shed_usage >= drop_pressure * shed_size:
+        elif hour == hours_per_day - 1 or shed_usage >= drop_pressure * shed_size:
             self.scheduler.drop_mode = "overflow"
         else:
             self.scheduler.drop_mode = "normal"
@@ -149,40 +178,33 @@ class KaggricultureAgent:
         # Keep the crew roster current (and re-hire at midnight roll-over).
         self._sync_workers(state, hour, target_hands)
 
-        # Daily routine at hour 0: re-hire the whole crew, then sell the shed.
-        # HIRE and SELL share the market bucket's 10-order cap (engine contract);
-        # HIRE is emitted first, mirroring the handover's morning order.
-        if hour == 0:
-            self._emit_hire(emitter, target_hands)
-            self._emit_sells(emitter, shed)
-
-        # Input purchases (fertilizer now; animals in Phase 4 step 2). Placed
-        # every turn outside endgame -- the scheduler's own gates (policy flags,
-        # shed capacity, "not already owned") keep it idempotent, and a home may
-        # finish building at any hour, so we cannot restrict buying to hour 0.
-        # Buying is disabled during endgame, when we only convert stock to cash.
-        if not in_endgame:
-            for order in self.scheduler.generate_market_orders(state, rules, shed_usage=shed_usage):
-                emitter.add_market_order(order)
-
-        # Endgame liquidation overlay: phone the broker EVERY turn (not just at
-        # hour 0) to convert inventory to cash before the season ends. Buying new
-        # land or animals is disabled here (no such purchases are built yet).
-        if in_endgame and hour != 0:
-            self._emit_sells(emitter, shed)
+        # Market plan for the turn (morning HIRE/SELL, input buys, endgame
+        # liquidation). Shared with the compliance audit via the scheduler so
+        # both emit an identical bucket; the emitter applies the 10-order cap.
+        for order in self.scheduler.daily_market_orders(
+            state, rules, hour, in_endgame, shed_usage=shed_usage
+        ):
+            emitter.add_market_order(order)
 
         # Generate prioritized tasks and route workers to them.
         care_capacity = self.care_monitor.capacity()
         tasks = self.scheduler.generate_tasks(
             state, rules, care_capacity, market_stocks=state["market_stocks"]
         )
+        workers = self._workers_list()
         actions = self.scheduler.assign_tasks(
-            self._workers_list(),
+            workers,
             tasks,
             rules,
             shed_usage=shed_usage,
             drop_mode=self.scheduler.drop_mode,
         )
+
+        # Feed the real idle fraction back to the CareMonitor so it can grow
+        # acreage when the crew has spare hands (and shrink it on thirst above).
+        if workers:
+            idle = sum(1 for w in workers if not actions.get(w["id"])) / len(workers)
+            self.care_monitor.note_idle(idle)
 
         self._emit_worker_actions(actions, emitter)
         self._advance_positions(state, actions)
@@ -269,17 +291,6 @@ class KaggricultureAgent:
     # ------------------------------------------------------------------ #
     # Emission helpers
     # ------------------------------------------------------------------ #
-    def _emit_hire(self, emitter, target_hands):
-        """Emit one HIRE order per hand to bring the crew up to strength."""
-        for _ in range(target_hands):
-            emitter.add_market_order(["HIRE"])
-
-    def _emit_sells(self, emitter, shed):
-        """Emit a SELL order for every shed item that has stock."""
-        for item, qty in shed.items():
-            if qty and qty > 0:
-                emitter.add_market_order(["SELL", item, int(qty)])
-
     def _emit_worker_actions(self, actions, emitter):
         """Route the scheduler's per-worker actions into the emitter buckets."""
         for worker in self._workers_list():
