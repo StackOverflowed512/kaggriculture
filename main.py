@@ -228,11 +228,17 @@ class KaggricultureAgent:
             return
 
         # Persistent local model: the farmer is permanent; the hired hands go
-        # home at midnight, so we (re)create them at hour 0 up to target_hands.
-        self.workers.setdefault("farmer", {"pos": self.HOME, "carried": 0, "carrying_item": None})
+        # home at midnight, so we recreate them at hour 0 up to target_hands.
+        # (setdefault would keep yesterday's ghost hands -- the engine has
+        # already dismissed them, so emitting actions for them is at best
+        # wasted and at worst an illegal-action risk.)
+        farmer = self.workers.get("farmer", {"pos": self.HOME, "carried": 0, "carrying_item": None})
         if hour == 0:
+            self.workers = {"farmer": farmer}
             for i in range(target_hands):
-                self.workers.setdefault(f"hand_{i}", {"pos": self.HOME, "carried": 0, "carrying_item": None})
+                self.workers[f"hand_{i}"] = {"pos": self.HOME, "carried": 0, "carrying_item": None}
+        else:
+            self.workers.setdefault("farmer", farmer)
 
     def _workers_list(self):
         """Roster as a list of dicts, farmer first then hands in index order."""
@@ -273,7 +279,10 @@ class KaggricultureAgent:
             if verb in self._MOVE_DELTA:
                 dx, dy = self._MOVE_DELTA[verb]
                 x, y = worker["pos"]
-                worker["pos"] = (x + dx, y + dy)
+                # Clamp to the 10x10 board so dead-reckoning can never drift
+                # off-grid even if a step action was emitted at a boundary.
+                nx, ny = max(0, min(9, x + dx)), max(0, min(9, y + dy))
+                worker["pos"] = (nx, ny)
             elif verb == "DROP":
                 worker["carried"] = 0
                 worker["carrying_item"] = None
@@ -286,7 +295,17 @@ class KaggricultureAgent:
                 worker["carried"] = max(0, worker.get("carried", 0) - 1)
                 worker["carrying_item"] = None
             elif verb == "HARVEST":
-                worker["carried"] += 1
+                # A harvest picks up the crop's full yield, not just one unit.
+                # Look up the crop at the worker's tile to get the right count;
+                # fall back to 1 if the tile is unknown (shouldn't happen, but
+                # keeps the local model from undercounting on edge cases).
+                crop = next((c for c in state.get("crops", [])
+                             if tuple(c.get("pos", (-1, -1))) == worker["pos"]), None)
+                if crop:
+                    params = self.rules.get("crop_params", {}).get(crop.get("type"), {})
+                    worker["carried"] += params.get("yield_no_fertilizer", 1)
+                else:
+                    worker["carried"] += 1
 
     # ------------------------------------------------------------------ #
     # Emission helpers

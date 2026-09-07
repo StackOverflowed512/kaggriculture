@@ -15,17 +15,20 @@ class Forecaster:
         """
         projected = current_money
         
-        # 1. Add value of shed inventory
+        # 1. Add value of shed inventory (only sellable products)
+        market = rules.get("market_params", {})
         for item, qty in shed_inventory.items():
-            if qty > 0:
+            if qty > 0 and item in market:
                 stock = current_market_stocks.get(item, 0)
                 avg_p = MarketModel.avg_price(rules, item, stock, qty)
                 projected += avg_p * qty
                 
         # 2. Add value of standing crops (simplified heuristic)
         for crop in standing_crops:
-            item = crop["type"]
-            params = rules["crop_params"].get(item)
+            item = crop.get("type")
+            if item is None:
+                continue
+            params = rules.get("crop_params", {}).get(item)
             if not params:
                 continue
                 
