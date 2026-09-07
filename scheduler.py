@@ -148,10 +148,10 @@ class Scheduler:
             empty_tiles:   list of plantable ``(x, y)`` tiles.
             market_stocks: dict of item -> current market inventory.
         """
-        dr = rules["daily_routines"]
+        dr = rules.get("daily_routines", {})
         policy = rules.get("policy", {})
         animals_on = policy.get("ANIMALS_ENABLED", False)
-        to_die = rules["constants"]["missed_waterings_to_die"]
+        to_die = rules.get("constants", {}).get("missed_waterings_to_die", 2)
         step = obs.get("step", 0)
 
         crops = obs.get("crops") or []
@@ -164,7 +164,10 @@ class Scheduler:
 
         # --- Standing crops: harvest when ripe, water by urgency band --------
         for crop in crops:
-            pos = tuple(crop["pos"])
+            pos = crop.get("pos")
+            if pos is None:
+                continue
+            pos = tuple(pos)
             ctype = crop.get("type")
             is_repeater = self._is_repeater(crop, rules, ctype)
 
@@ -241,7 +244,7 @@ class Scheduler:
         Buying is a market order (see generate_market_orders); the rest is
         worker work routed through the normal band matching.
         """
-        dr = rules["daily_routines"]
+        dr = rules.get("daily_routines", {})
         animal_params = rules.get("animal_params", {})
         animals = obs.get("animals") or []
         market_stocks = obs.get("market_stocks") or {}
@@ -250,9 +253,10 @@ class Scheduler:
         for animal in animals:
             atype = animal.get("type")
             params = animal_params.get(atype)
-            if not params or animal.get("home_pos") is None:
+            hp = animal.get("home_pos")
+            if not params or hp is None:
                 continue
-            home = tuple(animal["home_pos"])
+            home = tuple(hp)
 
             # Stage 1: build the home (COOP for geese, PASTURE for cows/sheep).
             if not animal.get("home_built", False):
@@ -326,7 +330,7 @@ class Scheduler:
         # owned. A bought animal arrives in the shed, so it takes one shed slot
         # until a worker carries it out to its home -- respect capacity.
         if policy.get("ANIMALS_ENABLED", False):
-            shed_size = rules["constants"]["shed_size"]
+            shed_size = rules.get("constants", {}).get("shed_size", 100)
             animal_params = rules.get("animal_params", {})
             for animal in (obs.get("animals") or []):
                 atype = animal.get("type")
@@ -341,10 +345,23 @@ class Scheduler:
         return orders
 
     @staticmethod
-    def _sell_orders(shed):
-        """A SELL order for every shed item that holds positive stock."""
-        return [["SELL", item, int(qty)] for item, qty in (shed or {}).items()
-                if qty and qty > 0]
+    def _sell_orders(shed, rules=None):
+        """A SELL order for every shed item that holds positive stock.
+
+        Only items with a ``market_params`` entry are offered -- inputs like
+        FERTILIZER or an unbought animal type are not sellable products and
+        emitting a SELL for them wastes a market slot (or worse, is rejected
+        by the engine).
+        """
+        market = rules.get("market_params", {}) if rules else None
+        orders = []
+        for item, qty in (shed or {}).items():
+            if not qty or int(qty) <= 0:
+                continue
+            if market is not None and item not in market:
+                continue
+            orders.append(["SELL", item, int(qty)])
+        return orders
 
     def daily_market_orders(self, state, rules, hour, in_endgame, shed_usage=0):
         """The full ordered market plan for one turn.
@@ -352,25 +369,38 @@ class Scheduler:
         Encodes the handover's morning-then-overlay ladder in one place so both
         the live agent (``main.py``) and the offline compliance audit emit an
         identical bucket (they previously duplicated this and could drift):
-            * hour 0        -> HIRE the crew up to ``target_hands``, then SELL the
-                               shed inventory.
+            * hour 0        -> SELL the shed inventory first (so harvest cash is
+                              banked), then HIRE the crew up to
+                              ``target_hands`` with whatever market slots
+                              remain.  Hiring is skipped entirely during
+                              endgame -- late-season hands cannot produce enough
+                              to justify their wage.
             * not endgame   -> input purchases (fertilizer / animals) from
                                ``generate_market_orders``.
             * endgame, h!=0 -> liquidate the shed every remaining turn.
         Orders are returned uncapped; the ``ActionEmitter`` applies the 10-order
-        engine cap at emission.
+        engine cap at emission.  Placing SELL before HIRE ensures that the
+        10-order cap never starves the morning sell when ``target_hands`` is 10.
         """
         policy = rules.get("policy", {})
+        constants = rules.get("constants", {})
         shed = state.get("shed") or {}
+        max_orders = constants.get("max_market_orders", 10)
         orders = []
         if hour == 0:
-            for _ in range(policy.get("target_hands", 10)):
-                orders.append(["HIRE"])
-            orders.extend(self._sell_orders(shed))
+            # Sell first -- the harvest must be banked before market slots are
+            # spent on hiring.  Hiring fills whatever slots remain.
+            sell = self._sell_orders(shed, rules)
+            orders.extend(sell)
+            if not in_endgame:
+                hire_slots = max(0, max_orders - len(sell))
+                target = policy.get("target_hands", 10)
+                for _ in range(min(target, hire_slots)):
+                    orders.append(["HIRE"])
         if not in_endgame:
             orders.extend(self.generate_market_orders(state, rules, shed_usage=shed_usage))
         elif hour != 0:
-            orders.extend(self._sell_orders(shed))
+            orders.extend(self._sell_orders(shed, rules))
         return orders
 
     # ------------------------------------------------------------------ #
@@ -396,6 +426,12 @@ class Scheduler:
         free = []
 
         # 1) DROP pre-emption ------------------------------------------------
+        # Track a projected shed fill so that when multiple carriers are
+        # preempted in the same pass, each successive check sees the load the
+        # earlier droppers will add -- otherwise two workers each carrying 20
+        # with the shed at 70 both see 90 > 80, both DROP, and the shed hits
+        # 110 (overflow / spill).
+        projected_shed = shed_usage
         for worker in workers:
             pos = tuple(worker["pos"])
             carried = worker.get("carried", 0)
@@ -403,8 +439,9 @@ class Scheduler:
             # animal for PLACE) must not be diverted to DROP -- that would dump
             # the very item it just picked up. Only loose harvest triggers DROP.
             if (carried > 0 and not worker.get("carrying_item")
-                    and (carried + shed_usage) > threshold):
+                    and (carried + projected_shed) > threshold):
                 actions[worker["id"]] = self._shed_action(pos)
+                projected_shed += carried
             else:
                 free.append(worker)
 
@@ -477,6 +514,12 @@ class Scheduler:
         # Fetch step: FEED/PLACE need an item carried from the shed first. Route
         # the worker to a shed tile and PICKUP before heading to the work tile.
         if task.fetch and worker.get("carrying_item") != task.fetch:
+            # If carrying the *wrong* item, DROP it first -- the engine does
+            # not allow PICKUP while already holding something.
+            if worker.get("carrying_item") is not None:
+                if pos in SHED_TILES:
+                    return ["DROP"]
+                return step_towards(pos, nearest_shed_tile(pos))
             if pos in SHED_TILES:
                 return ["PICKUP", task.fetch]
             return step_towards(pos, nearest_shed_tile(pos))
@@ -592,8 +635,8 @@ class Scheduler:
         params = rules.get("crop_params", {}).get(ctype)
         if not params:
             return False
-        hours_per_day = rules["constants"].get("hours_per_day", 24)
-        season_days = rules["constants"]["season_length"] // hours_per_day
+        hours_per_day = rules.get("constants", {}).get("hours_per_day", 24)
+        season_days = rules.get("constants", {}).get("season_length", 720) // hours_per_day
         day = step // hours_per_day
         if params.get("type") == "repeater":
             grow_days = params.get("first_fruit", season_days)
@@ -608,9 +651,9 @@ class Scheduler:
         overflow -> half the shed (tighten when a spill is imminent)
         endgame  -> 0 (every carried item must be banked before the clock ends)
         """
-        shed_size = rules["constants"]["shed_size"]
+        shed_size = rules.get("constants", {}).get("shed_size", 100)
         if mode == "endgame":
             return 0
         if mode == "overflow":
             return 0.5 * shed_size
-        return rules["policy"]["drop_pressure"] * shed_size
+        return rules.get("policy", {}).get("drop_pressure", 0.8) * shed_size

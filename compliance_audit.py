@@ -40,9 +40,9 @@ MARKET_VERBS = {"HIRE", "SELL", "BUY_PRODUCT"}
 def build_board(obs, rules):
     """Index an observation for O(1) tile lookups during the audit."""
     return {
-        "crops": {tuple(c["pos"]): c for c in obs.get("crops") or []},
-        "weeds": {tuple(w) for w in obs.get("weeds") or []},
-        "empty": {tuple(t) for t in obs.get("empty_tiles") or []},
+        "crops": {tuple(c["pos"]): c for c in obs.get("crops") or [] if c.get("pos") is not None},
+        "weeds": {tuple(w) for w in obs.get("weeds") or [] if w is not None},
+        "empty": {tuple(t) for t in obs.get("empty_tiles") or [] if t is not None},
         "homes": {tuple(a["home_pos"]) for a in (obs.get("animals") or [])
                   if a.get("home_built") and a.get("home_pos") is not None},
         "ready_animals": {tuple(a["home_pos"]) for a in (obs.get("animals") or [])
@@ -179,7 +179,11 @@ def _simulate_turn(sched, obs, rules):
     step = obs.get("step", 0)
     hour = step % hours_per_day
     in_endgame = step >= rules["policy"].get("endgame_start_turn", 670)
-    drop_mode = "endgame" if in_endgame else ("overflow" if hour == hours_per_day - 1 else "normal")
+    drop_mode = "endgame" if in_endgame else (
+        "overflow" if hour == hours_per_day - 1
+        or shed_usage >= rules.get("policy", {}).get("drop_pressure", 0.8)
+        * rules.get("constants", {}).get("shed_size", 100)
+        else "normal")
 
     tasks = sched.generate_tasks(obs, rules, care_capacity=100,
                                  market_stocks=obs.get("market_stocks"))

@@ -44,7 +44,7 @@ class MarketModel:
         enforcing the $1 price floor.
         """
         floor = rules.get("constants", {}).get("price_floor", 1)
-        params = rules["market_params"].get(item)
+        params = rules.get("market_params", {}).get(item)
         if not params:
             return int(floor)  # unknown items default to the floor
 
@@ -89,17 +89,19 @@ class MarketModel:
         Formula: (expected_units * expected_price - seed_cost) / cycle_length
         """
         values = {}
-        for crop, params in rules["crop_params"].items():
-            seed_cost = params["seed"]
+        for crop, params in rules.get("crop_params", {}).items():
+            seed_cost = params.get("seed", 0)
             # We assume no fertilizer for baseline calculation
-            expected_units = params.get("yield_no_fertilizer", 1) 
-            
-            if params["type"] == "repeater":
+            expected_units = params.get("yield_no_fertilizer", 1)
+
+            if params.get("type") == "repeater":
                 # For repeaters, it fruits max_fruits times.
-                expected_units = params["max_fruits"]
-                cycle_length = params["first_fruit"] + (params["max_fruits"] - 1) * params["fruit_every"]
+                expected_units = params.get("max_fruits", 1)
+                cycle_length = (params.get("first_fruit", 1)
+                                + (params.get("max_fruits", 1) - 1)
+                                * params.get("fruit_every", 1))
             else:
-                cycle_length = params["full_harvest"]
+                cycle_length = params.get("full_harvest", 1)
                 
             stock = current_market_stocks.get(crop, 0)
             
