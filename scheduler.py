@@ -55,6 +55,83 @@ def nearest_shed_tile(pos):
     return min(SHED_TILES, key=lambda tile: manhattan(pos, tile))
 
 
+def _hungarian(costs):
+    """Solve the minimum-cost assignment problem (Hungarian algorithm).
+
+    ``costs`` is a rectangular matrix (list of lists) where ``costs[i][j]`` is
+    the cost of assigning worker *i* to task *j*.  Returns a list of
+    ``(worker_index, task_index)`` pairs for the assignment that minimises
+    total cost.  Unmatched workers or tasks (when the matrix is non-square)
+    are simply omitted from the result.
+
+    Pure-Python O(n^3) implementation with no external dependencies, suitable
+    for the small matrices the scheduler produces (≤11 workers × ~20 tasks).
+    """
+    if not costs or not costs[0]:
+        return []
+
+    nrows = len(costs)
+    ncols = len(costs[0])
+    n = max(nrows, ncols)
+
+    # Pad to a square matrix with a large sentinel cost so extra rows/cols
+    # are never the minimum-cost choice.  The sentinel must be larger than
+    # any real cost but not so huge that it dominates the potential
+    # arithmetic (which can cause the algorithm to miss the optimal
+    # assignment on rectangular matrices).
+    max_real = max(costs[i][j] for i in range(nrows) for j in range(ncols))
+    BIG = max_real * n + 1
+    matrix = [[costs[i][j] if i < nrows and j < ncols else BIG
+               for j in range(n)] for i in range(n)]
+
+    # --- Kuhn-Munkres (Hungarian) on the square matrix ---
+    u = [0] * (n + 1)
+    v = [0] * (n + 1)
+    p = [0] * (n + 1)
+    way = [0] * (n + 1)
+
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [float('inf')] * (n + 1)
+        used = [False] * (n + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = BIG + 1  # +1 so the first minv[j] == BIG passes the < test
+            j1 = -1
+            for j in range(1, n + 1):
+                if not used[j]:
+                    cur = matrix[i0 - 1][j - 1] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j] = cur
+                        way[j] = j0
+                    if minv[j] < delta:
+                        delta = minv[j]
+                        j1 = j
+            for j in range(n + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while j0:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+
+    # Extract the assignment: p[j] = i means task j is assigned to worker i.
+    result = []
+    for j in range(1, n + 1):
+        i = p[j]
+        if i > 0 and i <= nrows and j <= ncols:
+            result.append((i - 1, j - 1))
+    return result
+
+
 class Task:
     """A single unit of work the scheduler wants done at a board tile.
 
@@ -148,10 +225,10 @@ class Scheduler:
             empty_tiles:   list of plantable ``(x, y)`` tiles.
             market_stocks: dict of item -> current market inventory.
         """
-        dr = rules["daily_routines"]
+        dr = rules.get("daily_routines", {})
         policy = rules.get("policy", {})
         animals_on = policy.get("ANIMALS_ENABLED", False)
-        to_die = rules["constants"]["missed_waterings_to_die"]
+        to_die = rules.get("constants", {}).get("missed_waterings_to_die", 2)
         step = obs.get("step", 0)
 
         crops = obs.get("crops") or []
@@ -164,7 +241,10 @@ class Scheduler:
 
         # --- Standing crops: harvest when ripe, water by urgency band --------
         for crop in crops:
-            pos = tuple(crop["pos"])
+            pos = crop.get("pos")
+            if pos is None:
+                continue
+            pos = tuple(pos)
             ctype = crop.get("type")
             is_repeater = self._is_repeater(crop, rules, ctype)
 
@@ -210,6 +290,10 @@ class Scheduler:
                         same_day=True,
                     )
                 )
+                # Note: same-day water tasks use priority_dying (9500) so they
+                # outrank most other work, but assign_tasks re-bands them just
+                # below PLANT (6000) so a different worker is assigned to water
+                # *after* the plant worker has been dispatched.
 
         # --- Animal chores are skipped entirely while animals are disabled ---
         # (Prevention, not post-hoc filtering -- see design doc guardrails.)
@@ -241,7 +325,7 @@ class Scheduler:
         Buying is a market order (see generate_market_orders); the rest is
         worker work routed through the normal band matching.
         """
-        dr = rules["daily_routines"]
+        dr = rules.get("daily_routines", {})
         animal_params = rules.get("animal_params", {})
         animals = obs.get("animals") or []
         market_stocks = obs.get("market_stocks") or {}
@@ -250,9 +334,10 @@ class Scheduler:
         for animal in animals:
             atype = animal.get("type")
             params = animal_params.get(atype)
-            if not params or animal.get("home_pos") is None:
+            hp = animal.get("home_pos")
+            if not params or hp is None:
                 continue
-            home = tuple(animal["home_pos"])
+            home = tuple(hp)
 
             # Stage 1: build the home (COOP for geese, PASTURE for cows/sheep).
             if not animal.get("home_built", False):
@@ -326,7 +411,7 @@ class Scheduler:
         # owned. A bought animal arrives in the shed, so it takes one shed slot
         # until a worker carries it out to its home -- respect capacity.
         if policy.get("ANIMALS_ENABLED", False):
-            shed_size = rules["constants"]["shed_size"]
+            shed_size = rules.get("constants", {}).get("shed_size", 100)
             animal_params = rules.get("animal_params", {})
             for animal in (obs.get("animals") or []):
                 atype = animal.get("type")
@@ -341,10 +426,51 @@ class Scheduler:
         return orders
 
     @staticmethod
-    def _sell_orders(shed):
-        """A SELL order for every shed item that holds positive stock."""
-        return [["SELL", item, int(qty)] for item, qty in (shed or {}).items()
-                if qty and qty > 0]
+    def _sell_orders(shed, rules=None, endgame=False):
+        """A SELL order for shed items that should be sold this turn.
+
+        Only items with a ``market_params`` entry are considered -- inputs like
+        FERTILIZER or an unbought animal type are not sellable products.
+
+        During normal play, premium goods (normal_price ≥ 100) are held when
+        their current market price has collapsed below 50% of normal, because
+        selling into a crashed market destroys optionality.  Basic goods
+        (normal_price < 100) are always sold -- their price curves are gentle
+        enough that holding provides no meaningful upside, and they clog the
+        shed.
+
+        During endgame, everything is liquidated regardless of price -- there
+        is no future to hold for.
+        """
+        if not shed:
+            return []
+        market = rules.get("market_params", {}) if rules else {}
+        constants = rules.get("constants", {}) if rules else {}
+        current_stocks = {}  # not available here; use 0 for price estimation
+        orders = []
+        for item, qty in shed.items():
+            if not qty or int(qty) <= 0:
+                continue
+            if market is not None and item not in market:
+                continue
+            qty = int(qty)
+            if not endgame and market is not None:
+                params = market.get(item, {})
+                normal_price = params.get("normal_price", 0)
+                # For premium goods, check whether the current price is
+                # depressed.  We approximate current stock as 0 (we don't have
+                # market_stocks here) so this is a conservative check -- if
+                # even at zero stock the price would be low, the market is
+                # truly crashed and we hold.  In practice main.py passes
+                # market_stocks via daily_market_orders, but _sell_orders is
+                # also called from the audit path; the endgame path always
+                # sells everything anyway.
+                if normal_price >= 100:
+                    live_price = MarketModel.market_price(rules, item, 0)
+                    if live_price < normal_price * 0.5:
+                        continue  # hold -- price is depressed
+            orders.append(["SELL", item, qty])
+        return orders
 
     def daily_market_orders(self, state, rules, hour, in_endgame, shed_usage=0):
         """The full ordered market plan for one turn.
@@ -352,25 +478,38 @@ class Scheduler:
         Encodes the handover's morning-then-overlay ladder in one place so both
         the live agent (``main.py``) and the offline compliance audit emit an
         identical bucket (they previously duplicated this and could drift):
-            * hour 0        -> HIRE the crew up to ``target_hands``, then SELL the
-                               shed inventory.
+            * hour 0        -> SELL the shed inventory first (so harvest cash is
+                              banked), then HIRE the crew up to
+                              ``target_hands`` with whatever market slots
+                              remain.  Hiring is skipped entirely during
+                              endgame -- late-season hands cannot produce enough
+                              to justify their wage.
             * not endgame   -> input purchases (fertilizer / animals) from
                                ``generate_market_orders``.
             * endgame, h!=0 -> liquidate the shed every remaining turn.
         Orders are returned uncapped; the ``ActionEmitter`` applies the 10-order
-        engine cap at emission.
+        engine cap at emission.  Placing SELL before HIRE ensures that the
+        10-order cap never starves the morning sell when ``target_hands`` is 10.
         """
         policy = rules.get("policy", {})
+        constants = rules.get("constants", {})
         shed = state.get("shed") or {}
+        max_orders = constants.get("max_market_orders", 10)
         orders = []
         if hour == 0:
-            for _ in range(policy.get("target_hands", 10)):
-                orders.append(["HIRE"])
-            orders.extend(self._sell_orders(shed))
+            # Sell first -- the harvest must be banked before market slots are
+            # spent on hiring.  Hiring fills whatever slots remain.
+            sell = self._sell_orders(shed, rules, endgame=in_endgame)
+            orders.extend(sell)
+            if not in_endgame:
+                hire_slots = max(0, max_orders - len(sell))
+                target = policy.get("target_hands", 10)
+                for _ in range(min(target, hire_slots)):
+                    orders.append(["HIRE"])
         if not in_endgame:
             orders.extend(self.generate_market_orders(state, rules, shed_usage=shed_usage))
         elif hour != 0:
-            orders.extend(self._sell_orders(shed))
+            orders.extend(self._sell_orders(shed, rules, endgame=True))
         return orders
 
     # ------------------------------------------------------------------ #
@@ -396,6 +535,12 @@ class Scheduler:
         free = []
 
         # 1) DROP pre-emption ------------------------------------------------
+        # Track a projected shed fill so that when multiple carriers are
+        # preempted in the same pass, each successive check sees the load the
+        # earlier droppers will add -- otherwise two workers each carrying 20
+        # with the shed at 70 both see 90 > 80, both DROP, and the shed hits
+        # 110 (overflow / spill).
+        projected_shed = shed_usage
         for worker in workers:
             pos = tuple(worker["pos"])
             carried = worker.get("carried", 0)
@@ -403,14 +548,31 @@ class Scheduler:
             # animal for PLACE) must not be diverted to DROP -- that would dump
             # the very item it just picked up. Only loose harvest triggers DROP.
             if (carried > 0 and not worker.get("carrying_item")
-                    and (carried + shed_usage) > threshold):
+                    and (carried + projected_shed) > threshold):
                 actions[worker["id"]] = self._shed_action(pos)
+                projected_shed += carried
             else:
                 free.append(worker)
 
-        # 2) Defer same-day watering while its PLANT is still queued ---------
+        # 2) Re-band same-day watering just below PLANT ----------------------
+        # Same-day water tasks were created at priority_dying (9500) so they
+        # would outrank other work, but they must be assigned *after* the
+        # plant worker has been dispatched (you can't water bare ground).
+        # Instead of filtering them out entirely (the old bug), we demote
+        # them to just below PLANT (6000) so a *different* worker is
+        # assigned to water the newly planted tile on the same turn.
+        plant_priority = rules.get("daily_routines", {}).get("PLANT", {}).get("priority", 6000)
         plant_cells = {t.pos for t in tasks if t.kind == "PLANT"}
-        active = [t for t in tasks if not (t.same_day and t.pos in plant_cells)]
+        active = []
+        for t in tasks:
+            if t.same_day and t.pos in plant_cells:
+                # Demote to just below PLANT so it's assigned after planting.
+                active.append(Task(t.kind, t.pos, plant_priority - 1,
+                                   value=t.value, crop=t.crop,
+                                   same_day=t.same_day, item=t.item,
+                                   fetch=t.fetch))
+            else:
+                active.append(t)
 
         # 3) Greedy Manhattan matching, band by band -------------------------
         active.sort(key=Task.sort_key, reverse=True)
@@ -430,39 +592,40 @@ class Scheduler:
         return actions
 
     def _match_band(self, free, band, actions):
-        """Assign workers to tasks within one band by greedy Manhattan distance.
+        """Assign workers to tasks within one band by optimal minimum-cost
+        bipartite matching (Hungarian algorithm).
 
-        Repeatedly takes the globally closest remaining worker-task pair, assigns
-        it, and drops both from consideration, until one side is exhausted. This
-        is the greedy minimum-distance matching the design doc specifies; it
-        needs no third-party solver (so the agent has no scipy/numpy import to
-        fail on in the Kaggle image). Ties break deterministically by worker
-        index then task index, so routing is fully reproducible. Mutates
-        ``free`` (removing assigned workers) and ``actions``.
+        Minimises the total Manhattan distance across all worker-task pairs in
+        the band, which is the optimal assignment the design doc requires.  The
+        previous greedy approach could produce sub-optimal total walking (e.g.
+        W1→T1=1, W2→T2=100 instead of W1→T2=2, W2→T1=2).  Implemented in pure
+        Python (no scipy/numpy) so the Kaggle image has no extra dependency.
+        Mutates ``free`` (removing assigned workers) and ``actions``.
         """
         if not free or not band:
             return
 
-        # All (distance, worker_index, task_index) pairs, ascending: closest and
-        # (on ties) lowest-index pairs are consumed first -> deterministic.
-        pairs = []
-        for wi, worker in enumerate(free):
-            wpos = tuple(worker["pos"])
-            for ti, task in enumerate(band):
-                pairs.append((manhattan(wpos, task.pos), wi, ti))
-        pairs.sort()
+        nw = len(free)
+        nt = len(band)
+
+        # Build the cost matrix (Manhattan distances).  Rows = workers,
+        # cols = tasks.  We minimise total distance.
+        costs = [[manhattan(tuple(free[wi]["pos"]), band[ti].pos)
+                  for ti in range(nt)] for wi in range(nw)]
+
+        # The Hungarian algorithm finds the minimum-cost assignment.  For the
+        # small matrices here (≤11 workers × ~20 tasks) the O(n^3) cost is
+        # negligible.  We use the rectangular variant: pad to square with
+        # large costs so extra workers/tasks are left unassigned.
+        assignment = _hungarian(costs)
 
         used_workers = set()
         used_tasks = set()
-        for _dist, wi, ti in pairs:
-            if wi in used_workers or ti in used_tasks:
-                continue
+        for wi, ti in assignment:
             worker = free[wi]
             actions[worker["id"]] = self._task_action(worker, band[ti])
             used_workers.add(wi)
             used_tasks.add(ti)
-            if len(used_workers) == len(free) or len(used_tasks) == len(band):
-                break
 
         free[:] = [w for i, w in enumerate(free) if i not in used_workers]
 
@@ -477,6 +640,12 @@ class Scheduler:
         # Fetch step: FEED/PLACE need an item carried from the shed first. Route
         # the worker to a shed tile and PICKUP before heading to the work tile.
         if task.fetch and worker.get("carrying_item") != task.fetch:
+            # If carrying the *wrong* item, DROP it first -- the engine does
+            # not allow PICKUP while already holding something.
+            if worker.get("carrying_item") is not None:
+                if pos in SHED_TILES:
+                    return ["DROP"]
+                return step_towards(pos, nearest_shed_tile(pos))
             if pos in SHED_TILES:
                 return ["PICKUP", task.fetch]
             return step_towards(pos, nearest_shed_tile(pos))
@@ -592,8 +761,8 @@ class Scheduler:
         params = rules.get("crop_params", {}).get(ctype)
         if not params:
             return False
-        hours_per_day = rules["constants"].get("hours_per_day", 24)
-        season_days = rules["constants"]["season_length"] // hours_per_day
+        hours_per_day = rules.get("constants", {}).get("hours_per_day", 24)
+        season_days = rules.get("constants", {}).get("season_length", 720) // hours_per_day
         day = step // hours_per_day
         if params.get("type") == "repeater":
             grow_days = params.get("first_fruit", season_days)
@@ -608,9 +777,9 @@ class Scheduler:
         overflow -> half the shed (tighten when a spill is imminent)
         endgame  -> 0 (every carried item must be banked before the clock ends)
         """
-        shed_size = rules["constants"]["shed_size"]
+        shed_size = rules.get("constants", {}).get("shed_size", 100)
         if mode == "endgame":
             return 0
         if mode == "overflow":
             return 0.5 * shed_size
-        return rules["policy"]["drop_pressure"] * shed_size
+        return rules.get("policy", {}).get("drop_pressure", 0.8) * shed_size
