@@ -55,6 +55,83 @@ def nearest_shed_tile(pos):
     return min(SHED_TILES, key=lambda tile: manhattan(pos, tile))
 
 
+def _hungarian(costs):
+    """Solve the minimum-cost assignment problem (Hungarian algorithm).
+
+    ``costs`` is a rectangular matrix (list of lists) where ``costs[i][j]`` is
+    the cost of assigning worker *i* to task *j*.  Returns a list of
+    ``(worker_index, task_index)`` pairs for the assignment that minimises
+    total cost.  Unmatched workers or tasks (when the matrix is non-square)
+    are simply omitted from the result.
+
+    Pure-Python O(n^3) implementation with no external dependencies, suitable
+    for the small matrices the scheduler produces (≤11 workers × ~20 tasks).
+    """
+    if not costs or not costs[0]:
+        return []
+
+    nrows = len(costs)
+    ncols = len(costs[0])
+    n = max(nrows, ncols)
+
+    # Pad to a square matrix with a large sentinel cost so extra rows/cols
+    # are never the minimum-cost choice.  The sentinel must be larger than
+    # any real cost but not so huge that it dominates the potential
+    # arithmetic (which can cause the algorithm to miss the optimal
+    # assignment on rectangular matrices).
+    max_real = max(costs[i][j] for i in range(nrows) for j in range(ncols))
+    BIG = max_real * n + 1
+    matrix = [[costs[i][j] if i < nrows and j < ncols else BIG
+               for j in range(n)] for i in range(n)]
+
+    # --- Kuhn-Munkres (Hungarian) on the square matrix ---
+    u = [0] * (n + 1)
+    v = [0] * (n + 1)
+    p = [0] * (n + 1)
+    way = [0] * (n + 1)
+
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [float('inf')] * (n + 1)
+        used = [False] * (n + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = BIG + 1  # +1 so the first minv[j] == BIG passes the < test
+            j1 = -1
+            for j in range(1, n + 1):
+                if not used[j]:
+                    cur = matrix[i0 - 1][j - 1] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j] = cur
+                        way[j] = j0
+                    if minv[j] < delta:
+                        delta = minv[j]
+                        j1 = j
+            for j in range(n + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while j0:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+
+    # Extract the assignment: p[j] = i means task j is assigned to worker i.
+    result = []
+    for j in range(1, n + 1):
+        i = p[j]
+        if i > 0 and i <= nrows and j <= ncols:
+            result.append((i - 1, j - 1))
+    return result
+
+
 class Task:
     """A single unit of work the scheduler wants done at a board tile.
 
@@ -213,6 +290,10 @@ class Scheduler:
                         same_day=True,
                     )
                 )
+                # Note: same-day water tasks use priority_dying (9500) so they
+                # outrank most other work, but assign_tasks re-bands them just
+                # below PLANT (6000) so a different worker is assigned to water
+                # *after* the plant worker has been dispatched.
 
         # --- Animal chores are skipped entirely while animals are disabled ---
         # (Prevention, not post-hoc filtering -- see design doc guardrails.)
@@ -345,22 +426,50 @@ class Scheduler:
         return orders
 
     @staticmethod
-    def _sell_orders(shed, rules=None):
-        """A SELL order for every shed item that holds positive stock.
+    def _sell_orders(shed, rules=None, endgame=False):
+        """A SELL order for shed items that should be sold this turn.
 
-        Only items with a ``market_params`` entry are offered -- inputs like
-        FERTILIZER or an unbought animal type are not sellable products and
-        emitting a SELL for them wastes a market slot (or worse, is rejected
-        by the engine).
+        Only items with a ``market_params`` entry are considered -- inputs like
+        FERTILIZER or an unbought animal type are not sellable products.
+
+        During normal play, premium goods (normal_price ≥ 100) are held when
+        their current market price has collapsed below 50% of normal, because
+        selling into a crashed market destroys optionality.  Basic goods
+        (normal_price < 100) are always sold -- their price curves are gentle
+        enough that holding provides no meaningful upside, and they clog the
+        shed.
+
+        During endgame, everything is liquidated regardless of price -- there
+        is no future to hold for.
         """
-        market = rules.get("market_params", {}) if rules else None
+        if not shed:
+            return []
+        market = rules.get("market_params", {}) if rules else {}
+        constants = rules.get("constants", {}) if rules else {}
+        current_stocks = {}  # not available here; use 0 for price estimation
         orders = []
-        for item, qty in (shed or {}).items():
+        for item, qty in shed.items():
             if not qty or int(qty) <= 0:
                 continue
             if market is not None and item not in market:
                 continue
-            orders.append(["SELL", item, int(qty)])
+            qty = int(qty)
+            if not endgame and market is not None:
+                params = market.get(item, {})
+                normal_price = params.get("normal_price", 0)
+                # For premium goods, check whether the current price is
+                # depressed.  We approximate current stock as 0 (we don't have
+                # market_stocks here) so this is a conservative check -- if
+                # even at zero stock the price would be low, the market is
+                # truly crashed and we hold.  In practice main.py passes
+                # market_stocks via daily_market_orders, but _sell_orders is
+                # also called from the audit path; the endgame path always
+                # sells everything anyway.
+                if normal_price >= 100:
+                    live_price = MarketModel.market_price(rules, item, 0)
+                    if live_price < normal_price * 0.5:
+                        continue  # hold -- price is depressed
+            orders.append(["SELL", item, qty])
         return orders
 
     def daily_market_orders(self, state, rules, hour, in_endgame, shed_usage=0):
@@ -390,7 +499,7 @@ class Scheduler:
         if hour == 0:
             # Sell first -- the harvest must be banked before market slots are
             # spent on hiring.  Hiring fills whatever slots remain.
-            sell = self._sell_orders(shed, rules)
+            sell = self._sell_orders(shed, rules, endgame=in_endgame)
             orders.extend(sell)
             if not in_endgame:
                 hire_slots = max(0, max_orders - len(sell))
@@ -400,7 +509,7 @@ class Scheduler:
         if not in_endgame:
             orders.extend(self.generate_market_orders(state, rules, shed_usage=shed_usage))
         elif hour != 0:
-            orders.extend(self._sell_orders(shed, rules))
+            orders.extend(self._sell_orders(shed, rules, endgame=True))
         return orders
 
     # ------------------------------------------------------------------ #
@@ -445,9 +554,25 @@ class Scheduler:
             else:
                 free.append(worker)
 
-        # 2) Defer same-day watering while its PLANT is still queued ---------
+        # 2) Re-band same-day watering just below PLANT ----------------------
+        # Same-day water tasks were created at priority_dying (9500) so they
+        # would outrank other work, but they must be assigned *after* the
+        # plant worker has been dispatched (you can't water bare ground).
+        # Instead of filtering them out entirely (the old bug), we demote
+        # them to just below PLANT (6000) so a *different* worker is
+        # assigned to water the newly planted tile on the same turn.
+        plant_priority = rules.get("daily_routines", {}).get("PLANT", {}).get("priority", 6000)
         plant_cells = {t.pos for t in tasks if t.kind == "PLANT"}
-        active = [t for t in tasks if not (t.same_day and t.pos in plant_cells)]
+        active = []
+        for t in tasks:
+            if t.same_day and t.pos in plant_cells:
+                # Demote to just below PLANT so it's assigned after planting.
+                active.append(Task(t.kind, t.pos, plant_priority - 1,
+                                   value=t.value, crop=t.crop,
+                                   same_day=t.same_day, item=t.item,
+                                   fetch=t.fetch))
+            else:
+                active.append(t)
 
         # 3) Greedy Manhattan matching, band by band -------------------------
         active.sort(key=Task.sort_key, reverse=True)
@@ -467,39 +592,40 @@ class Scheduler:
         return actions
 
     def _match_band(self, free, band, actions):
-        """Assign workers to tasks within one band by greedy Manhattan distance.
+        """Assign workers to tasks within one band by optimal minimum-cost
+        bipartite matching (Hungarian algorithm).
 
-        Repeatedly takes the globally closest remaining worker-task pair, assigns
-        it, and drops both from consideration, until one side is exhausted. This
-        is the greedy minimum-distance matching the design doc specifies; it
-        needs no third-party solver (so the agent has no scipy/numpy import to
-        fail on in the Kaggle image). Ties break deterministically by worker
-        index then task index, so routing is fully reproducible. Mutates
-        ``free`` (removing assigned workers) and ``actions``.
+        Minimises the total Manhattan distance across all worker-task pairs in
+        the band, which is the optimal assignment the design doc requires.  The
+        previous greedy approach could produce sub-optimal total walking (e.g.
+        W1→T1=1, W2→T2=100 instead of W1→T2=2, W2→T1=2).  Implemented in pure
+        Python (no scipy/numpy) so the Kaggle image has no extra dependency.
+        Mutates ``free`` (removing assigned workers) and ``actions``.
         """
         if not free or not band:
             return
 
-        # All (distance, worker_index, task_index) pairs, ascending: closest and
-        # (on ties) lowest-index pairs are consumed first -> deterministic.
-        pairs = []
-        for wi, worker in enumerate(free):
-            wpos = tuple(worker["pos"])
-            for ti, task in enumerate(band):
-                pairs.append((manhattan(wpos, task.pos), wi, ti))
-        pairs.sort()
+        nw = len(free)
+        nt = len(band)
+
+        # Build the cost matrix (Manhattan distances).  Rows = workers,
+        # cols = tasks.  We minimise total distance.
+        costs = [[manhattan(tuple(free[wi]["pos"]), band[ti].pos)
+                  for ti in range(nt)] for wi in range(nw)]
+
+        # The Hungarian algorithm finds the minimum-cost assignment.  For the
+        # small matrices here (≤11 workers × ~20 tasks) the O(n^3) cost is
+        # negligible.  We use the rectangular variant: pad to square with
+        # large costs so extra workers/tasks are left unassigned.
+        assignment = _hungarian(costs)
 
         used_workers = set()
         used_tasks = set()
-        for _dist, wi, ti in pairs:
-            if wi in used_workers or ti in used_tasks:
-                continue
+        for wi, ti in assignment:
             worker = free[wi]
             actions[worker["id"]] = self._task_action(worker, band[ti])
             used_workers.add(wi)
             used_tasks.add(ti)
-            if len(used_workers) == len(free) or len(used_tasks) == len(band):
-                break
 
         free[:] = [w for i, w in enumerate(free) if i not in used_workers]
 

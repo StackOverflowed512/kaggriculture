@@ -93,10 +93,14 @@ class RulesLoader:
         "CORRECTION_THRESHOLD"
     ]
 
-    def __init__(self, rules_path: str = "rules_validated.json"):
+    def __init__(self, rules_path: str = "rules_validated.json", strict: bool = False):
         self.rules_path = rules_path
         self._rules = None
         self._provenance = None
+        # When strict=True (release builds), a missing rules file is a hard
+        # failure instead of silently falling back to embedded rules.  This
+        # prevents packaging defects from being hidden by the fallback.
+        self.strict = strict
 
     def _resolve_path(self):
         """Find the rules file across the provenance chain, or None.
@@ -137,8 +141,15 @@ class RulesLoader:
                     raise ValueError(f"Failed to parse rules JSON: {e}")
             provenance = path
         else:
-            # No rules file anywhere -> fall back to the embedded copy so the
-            # agent still plays instead of PASSing the whole season.
+            # No rules file anywhere.
+            if self.strict:
+                # Release builds must fail loudly -- the embedded fallback
+                # can hide packaging defects and run on stale rule data.
+                raise FileNotFoundError(
+                    f"Rules file '{self.rules_path}' not found and strict mode "
+                    f"is enabled.  Package the rules file or disable strict mode.")
+            # Non-strict: fall back to the embedded copy so the agent still
+            # plays instead of PASSing the whole season.
             data = copy.deepcopy(EMBEDDED_RULES)
             provenance = "embedded"
 

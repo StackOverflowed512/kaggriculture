@@ -42,9 +42,8 @@ class KaggricultureAgent:
         self.workers = {"farmer": {"pos": self.HOME, "carried": 0, "carrying_item": None}}
 
     def __call__(self, obs, config):
-        step = obs.step if hasattr(obs, 'step') else obs.get('step', 0)
-
         try:
+            step = obs.step if hasattr(obs, 'step') else obs.get('step', 0)
             # Load rules if not already loaded
             if self.rules is None:
                 self.rules = self.rules_loader.load_rules()
@@ -95,7 +94,12 @@ class KaggricultureAgent:
 
         except Exception as e:
             # Exception containment: never crash the season
-            self.telemetry.record_exception(step, e)
+            step_val = step if 'step' in locals() else -1
+            self.telemetry.record_exception(step_val, e)
+            # Recurring-exception detection: if exceptions keep happening,
+            # the agent is silently PASSing and wasting the entire season.
+            # Telemetry records this so the validation pipeline can treat
+            # any exception count > 0 as a release blocker.
             self.telemetry.flush_to_disk()
 
             # Degrade gracefully to PASS
@@ -213,13 +217,26 @@ class KaggricultureAgent:
     # Worker roster helpers
     # ------------------------------------------------------------------ #
     def _sync_workers(self, state, hour, target_hands):
-        """Refresh the roster from the observation, or maintain it locally."""
+        """Refresh the roster from the observation, or maintain it locally.
+
+        The engine observation is authoritative when present.  When it is
+        absent (None), we fall back to the persistent local model and
+        dead-reckon positions.  This is a safety net, not a primary source --
+        if the engine ever reports worker state we immediately discard our
+        dead-reckoned model and trust the observation.
+        """
         if state["workers"] is not None:
             # Trust the live observation for positions and carried loads.
+            # This is the authoritative source -- dead-reckoning is never
+            # used when the engine reports worker state.
             roster = {}
             for w in state["workers"]:
-                roster[w["id"]] = {
-                    "pos": tuple(w["pos"]),
+                wid = w.get("id")
+                wpos = w.get("pos")
+                if wid is None or wpos is None:
+                    continue
+                roster[wid] = {
+                    "pos": tuple(wpos),
                     "carried": w.get("carried", 0),
                     "carrying_item": w.get("carrying_item"),
                 }

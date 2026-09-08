@@ -86,35 +86,53 @@ class MarketModel:
     def crop_values(rules: dict, current_market_stocks: dict) -> dict:
         """
         Ranks crops dynamically based on expected economic value per tile per turn.
-        Formula: (expected_units * expected_price - seed_cost) / cycle_length
+
+        Improved model accounts for:
+        * Market depletion from our own production (price drops as we sell).
+        * A stock buffer estimating opponent-induced price pressure.
+        * Watering burden (worker-turns spent watering during the cycle).
+        * Opportunity cost (longer cycles = fewer harvests per season).
+
+        Formula:
+            EV/turn = (avg_price(yield, stock + buffer) * yield - seed_cost
+                       - watering_cost) / cycle_length
+        where buffer ≈ yield * 2 (conservative opponent production estimate)
+        and watering_cost = watering_events * WATER_COST_PER_TURN.
         """
+        WATER_COST_PER_TURN = 2  # estimated worker-turn cost per watering
+        STOCK_BUFFER_MULT = 2    # opponent production multiplier
+
         values = {}
         for crop, params in rules.get("crop_params", {}).items():
             seed_cost = params.get("seed", 0)
-            # We assume no fertilizer for baseline calculation
             expected_units = params.get("yield_no_fertilizer", 1)
 
             if params.get("type") == "repeater":
-                # For repeaters, it fruits max_fruits times.
                 expected_units = params.get("max_fruits", 1)
                 cycle_length = (params.get("first_fruit", 1)
                                 + (params.get("max_fruits", 1) - 1)
                                 * params.get("fruit_every", 1))
+                # Repeaters need ongoing watering every fruit_every days
+                watering_events = max(1, cycle_length // max(1, params.get("fruit_every", 1)))
             else:
                 cycle_length = params.get("full_harvest", 1)
-                
+                # One-time crops need watering during their watering window
+                ww = params.get("watering_window", [1, 1])
+                watering_events = max(1, ww[1] - ww[0] + 1) if len(ww) >= 2 else 1
+
             stock = current_market_stocks.get(crop, 0)
-            
-            # Predict the average price we'd get for this yield
-            # Since market prices drop as others sell, we might want to add a safety buffer 
-            # to the current stock. For now, we use current stock.
-            avg_p = MarketModel.avg_price(rules, crop, stock, expected_units)
-            
+
+            # Add a stock buffer to model the price depression caused by our
+            # own production and estimated opponent output.  This prevents the
+            # optimizer from recommending a crop whose market is about to crash.
+            buffered_stock = stock + expected_units * STOCK_BUFFER_MULT
+            avg_p = MarketModel.avg_price(rules, crop, buffered_stock, expected_units)
+
             expected_revenue = avg_p * expected_units
-            profit = expected_revenue - seed_cost
-            
+            watering_cost = watering_events * WATER_COST_PER_TURN
+            profit = expected_revenue - seed_cost - watering_cost
+
             ev_per_turn = profit / cycle_length if cycle_length > 0 else 0
             values[crop] = ev_per_turn
-            
-        # Return sorted dict by EV descending
+
         return dict(sorted(values.items(), key=lambda item: item[1], reverse=True))
