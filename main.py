@@ -320,7 +320,10 @@ class KaggricultureAgent:
                              if tuple(c.get("pos", (-1, -1))) == worker["pos"]), None)
                 if crop:
                     params = self.rules.get("crop_params", {}).get(crop.get("type"), {})
-                    worker["carried"] += params.get("yield_no_fertilizer", 1)
+                    if crop.get("fertilized", False) or crop.get("misses", 0) < 0:
+                        worker["carried"] += params.get("yield_fertilized", params.get("yield_no_fertilizer", 1))
+                    else:
+                        worker["carried"] += params.get("yield_no_fertilizer", 1)
                 else:
                     worker["carried"] += 1
 

@@ -426,7 +426,7 @@ class Scheduler:
         return orders
 
     @staticmethod
-    def _sell_orders(shed, rules=None, endgame=False):
+    def _sell_orders(shed, rules=None, endgame=False, market_stocks=None):
         """A SELL order for shed items that should be sold this turn.
 
         Only items with a ``market_params`` entry are considered -- inputs like
@@ -446,7 +446,6 @@ class Scheduler:
             return []
         market = rules.get("market_params", {}) if rules else {}
         constants = rules.get("constants", {}) if rules else {}
-        current_stocks = {}  # not available here; use 0 for price estimation
         orders = []
         for item, qty in shed.items():
             if not qty or int(qty) <= 0:
@@ -466,7 +465,8 @@ class Scheduler:
                 # also called from the audit path; the endgame path always
                 # sells everything anyway.
                 if normal_price >= 100:
-                    live_price = MarketModel.market_price(rules, item, 0)
+                    stock = market_stocks.get(item, 0) if market_stocks else 0
+                    live_price = MarketModel.market_price(rules, item, stock)
                     if live_price < normal_price * 0.5:
                         continue  # hold -- price is depressed
             orders.append(["SELL", item, qty])
@@ -491,25 +491,25 @@ class Scheduler:
         engine cap at emission.  Placing SELL before HIRE ensures that the
         10-order cap never starves the morning sell when ``target_hands`` is 10.
         """
-        policy = rules.get("policy", {})
-        constants = rules.get("constants", {})
+        policy = rules.get("policy", {}) if rules else {}
         shed = state.get("shed") or {}
-        max_orders = constants.get("max_market_orders", 10)
+        market_stocks = state.get("market_stocks") or {}
         orders = []
+        max_orders = rules.get("constants", {}).get("max_market_orders", 10) if rules else 10
         if hour == 0:
             # Sell first -- the harvest must be banked before market slots are
             # spent on hiring.  Hiring fills whatever slots remain.
-            sell = self._sell_orders(shed, rules, endgame=in_endgame)
+            sell = self._sell_orders(shed, endgame=in_endgame, rules=rules, market_stocks=market_stocks)
             orders.extend(sell)
             if not in_endgame:
                 hire_slots = max(0, max_orders - len(sell))
-                target = policy.get("target_hands", 10)
+                target = policy.get("target_hands", 10) if isinstance(policy, dict) else 10
                 for _ in range(min(target, hire_slots)):
                     orders.append(["HIRE"])
         if not in_endgame:
             orders.extend(self.generate_market_orders(state, rules, shed_usage=shed_usage))
         elif hour != 0:
-            orders.extend(self._sell_orders(shed, rules, endgame=True))
+            orders.extend(self._sell_orders(shed, endgame=True, rules=rules, market_stocks=market_stocks))
         return orders
 
     # ------------------------------------------------------------------ #

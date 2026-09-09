@@ -1,3 +1,5 @@
+import collections
+
 class CareMonitor:
     """
     Tracks crop-care coverage, losses, and production capacity.
@@ -17,6 +19,7 @@ class CareMonitor:
         self.deaths = 0
         self.coverage_log = []
         self._recent_misses = []  # rolling window of missed_waterings per day
+        self._recent_idle = collections.deque(maxlen=24) # 24 turns = 1 day
 
     def note_idle(self, idle_fraction: float):
         """
@@ -26,10 +29,13 @@ class CareMonitor:
         fraction over the recent window exceeds the threshold, preventing
         expansion from a single idle turn.
         """
-        if idle_fraction > 0.1:
-            # Expand slowly -- but only when we have evidence of sustained
-            # spare capacity, not just one idle turn.
-            self.capacity_target = min(100, self.capacity_target + 1)
+        self._recent_idle.append(idle_fraction)
+        if len(self._recent_idle) == self._recent_idle.maxlen:
+            avg_idle = sum(self._recent_idle) / len(self._recent_idle)
+            if avg_idle > 0.1:
+                # Expand slowly -- but only when we have evidence of sustained
+                # spare capacity, not just one idle turn.
+                self.capacity_target = min(100, self.capacity_target + 1)
 
     def observe_day(self, day: int, missed_waterings: int):
         """
