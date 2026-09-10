@@ -1,5 +1,6 @@
 __pycache__/
 submission.tar.gz
+submission_single_file.py
 
 # Run artifacts written by the agent / release tooling
 telemetry_run_*.json

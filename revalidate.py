@@ -166,15 +166,72 @@ def check_archive_layout(archive=DEFAULT_OUTPUT):
     return True, f"{archive} contains the {len(expected)} expected members"
 
 
+@requirement("REQ-06-NOEXC")
+def check_no_silent_exceptions(rules):
+    """A well-formed season raises zero contained exceptions.
+
+    Runtime containment (REQ-02) is a safety net for *malformed* input: it must
+    swallow-and-PASS so one bad turn can't zero the season.  But an exception on
+    *well-formed* input means the agent is silently PASSing turns it should be
+    playing -- the manager's "recurring exception" concern.  This check drives a
+    realistic multi-turn season (hiring at dawn, watering, weeding, selling,
+    endgame liquidation, terminal flush) through a fresh agent and asserts the
+    telemetry exception counter never moves.  A single contained exception here
+    is a release blocker, even though the same exception would (correctly) be
+    swallowed at runtime.
+    """
+    agent = _fresh_agent()
+    hours_per_day = rules["constants"].get("hours_per_day", 24)
+    season_length = rules["constants"].get("season_length", 720)
+
+    def crop_field(step):
+        # A spread of crops in varying watering states across the board.
+        return [{"pos": (i % 10, (i * 3) % 10), "type": "WHEAT",
+                 "misses": (step + i) % 2, "needs_water": (i % 2 == 0)}
+                for i in range(12)] + \
+               [{"pos": (2, 8), "type": "MELON", "misses": step % 2, "needs_water": True}]
+
+    def workers(step):
+        return [{"id": "farmer", "pos": (4, 4), "carried": step % 3}] + \
+               [{"id": f"hand_{i}", "pos": (i, (i * 2) % 10),
+                 "carried": (step + i) % 4} for i in range(10)]
+
+    # Sample every in-game hour across representative days: dawn roll-over
+    # (hour 0 hiring/selling), mid-day work, the last hour of a day (overflow),
+    # the endgame window, and the terminal turn (telemetry flush).
+    steps = list(range(0, 3 * hours_per_day))           # first three full days
+    steps += [670, 690, 700, 719]                        # endgame + terminal
+    steps += [d * hours_per_day for d in range(4, 30)]   # every subsequent dawn
+
+    for step in steps:
+        obs = {
+            "step": step,
+            "crops": crop_field(step),
+            "weeds": [(9, 9), (0, 5)] if step % 3 else [],
+            "empty_tiles": [(5, 5), (6, 6)],
+            "shed": {"WHEAT": 8 + (step % 5), "MELON": step % 4},
+            "market_stocks": {"WHEAT": 100 + step, "MELON": 40},
+            "money": 1000 + step * 3,
+            "workers": workers(step),
+        }
+        agent(obs, {})
+
+    count = agent.telemetry.get_exception_count()
+    if count:
+        return False, f"{count} contained exception(s) on well-formed input (release blocker)"
+    return True, f"{len(steps)} well-formed turns raised zero contained exceptions"
+
+
 def revalidate(max_latency=DEFAULT_MAX_LATENCY):
     """Run every acceptance check. Returns ``(ok, results)``."""
     rules = RulesLoader("rules_validated.json").load_rules()
-    
+
     checks = [
         ("output structure", check_output_structure, [rules]),
         ("exception containment", check_exception_containment, []),
         ("latency", check_latency, [max_latency]),
         ("watering coverage", check_watering_coverage, [rules]),
+        ("no silent exceptions", check_no_silent_exceptions, [rules]),
         ("archive layout", check_archive_layout, []),
     ]
     

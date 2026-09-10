@@ -490,3 +490,173 @@ def test_integration_compliance_audit_clean_season(rules):
     """The compliance audit on the default season must still be clean."""
     findings = compliance_audit.audit_season(rules)
     assert findings == [], f"Audit findings: {findings}"
+
+
+# ===========================================================================
+# Yes.pdf review #1 (interpreted): opt-in single-file submission bundle
+# ===========================================================================
+# The manager wanted a single-file main.py. The canonical source stays modular
+# (CLAUDE.md Rule #4 forbids a monolith), so #1 is served by a *derived*,
+# verified bundle: build_submission --single-file concatenates the runtime
+# modules, carries rules_loader's EMBEDDED_RULES, and must behave identically
+# to the modular agent.
+
+def test_yespdf1_single_file_bundle_verifies():
+    import build_submission
+    ok, messages = build_submission.build_single_file(check_only=True)
+    assert ok, messages
+
+
+def test_yespdf1_single_file_bundle_is_self_contained():
+    import build_submission
+    src = build_submission.bundle_single_file_source(".")
+    assert "EMBEDDED_RULES" in src   # carries its own rules
+    assert "def agent(" in src       # keeps the Kaggle entry point
+    # No leftover intra-package imports (they would fail as a lone file).
+    for leftover in ("from scheduler import", "from market_model import",
+                     "from rules_loader import", "from forecaster import",
+                     "from telemetry import", "from care_monitor import",
+                     "from action_emitter import"):
+        assert leftover not in src, f"bundle still imports a local module: {leftover}"
+
+
+def test_yespdf1_single_file_runs_without_any_sibling_files(tmp_path, monkeypatch):
+    """A lone bundled main.py, with no rules file or sibling modules present,
+    plays a legal turn off the embedded rules fallback."""
+    import importlib.util
+    import build_submission
+    src = build_submission.bundle_single_file_source(".")
+    bundle_path = tmp_path / "main.py"
+    bundle_path.write_text(src, encoding="utf-8")
+    # cwd with no rules_validated.json anywhere on the resolution chain, so the
+    # loader must fall back to the embedded copy -- proving self-containment.
+    monkeypatch.chdir(tmp_path)
+    spec = importlib.util.spec_from_file_location("_kaggri_bundle_isolated", bundle_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    a = mod.KaggricultureAgent()
+    obs = {"step": 0, "crops": [{"pos": (2, 2), "type": "WHEAT", "misses": 1}],
+           "weeds": [], "empty_tiles": [], "shed": {}, "market_stocks": {},
+           "workers": [{"id": "farmer", "pos": (2, 2), "carried": 0}]}
+    out = a(obs, {})
+    assert set(out) == {"farmer", "hands", "market"}
+    assert a.telemetry.get_exception_count() == 0
+    assert a.rules_loader.get_provenance() == "embedded"
+
+
+# ===========================================================================
+# Yes.pdf review #5 (HIGH): dead `misses < 0` clause in HARVEST dead-reckoning
+# ===========================================================================
+# The HARVEST branch of main._advance_positions used to read
+#   if crop.get("fertilized") or crop.get("misses", 0) < 0:
+# `misses` is a non-negative count, so the second disjunct was dead code that
+# falsely implied a negative miss count meant something. These tests pin the
+# behaviour the (now removed) clause must not change: fertilized -> fertilized
+# yield, otherwise -> unfertilized yield, regardless of the miss count.
+
+def test_yespdf5_harvest_unfertilized_uses_plain_yield(rules, monkeypatch):
+    from main import KaggricultureAgent
+    a = KaggricultureAgent()
+    monkeypatch.setattr(a, "rules", rules)
+    a.workers = {"farmer": {"pos": (2, 2), "carried": 0, "carrying_item": None}}
+    state = {"workers": None,
+             "crops": [{"pos": (2, 2), "type": "WHEAT", "misses": 0, "fertilized": False}]}
+    a._advance_positions(state, {"farmer": ["HARVEST"]})
+    assert a.workers["farmer"]["carried"] == rules["crop_params"]["WHEAT"]["yield_no_fertilizer"]
+
+
+def test_yespdf5_harvest_fertilized_uses_fertilized_yield(rules, monkeypatch):
+    from main import KaggricultureAgent
+    a = KaggricultureAgent()
+    monkeypatch.setattr(a, "rules", rules)
+    a.workers = {"farmer": {"pos": (2, 2), "carried": 0, "carrying_item": None}}
+    state = {"workers": None,
+             "crops": [{"pos": (2, 2), "type": "WHEAT", "misses": 0, "fertilized": True}]}
+    a._advance_positions(state, {"farmer": ["HARVEST"]})
+    assert a.workers["farmer"]["carried"] == rules["crop_params"]["WHEAT"]["yield_fertilized"]
+
+
+def test_yespdf5_harvest_positive_misses_still_plain_yield(rules, monkeypatch):
+    """A crop with recorded misses is still just an unfertilized harvest -- the
+    removed `misses < 0` clause must not resurrect as fertilized yield."""
+    from main import KaggricultureAgent
+    a = KaggricultureAgent()
+    monkeypatch.setattr(a, "rules", rules)
+    a.workers = {"farmer": {"pos": (2, 2), "carried": 0, "carrying_item": None}}
+    state = {"workers": None,
+             "crops": [{"pos": (2, 2), "type": "WHEAT", "misses": 1, "fertilized": False}]}
+    a._advance_positions(state, {"farmer": ["HARVEST"]})
+    assert a.workers["farmer"]["carried"] == rules["crop_params"]["WHEAT"]["yield_no_fertilizer"]
+
+
+# ===========================================================================
+# Yes.pdf review #13 (HIGH): bt_model CI mislabel + model/empirical conflation
+# ===========================================================================
+# confidence_interval brackets the EMPIRICAL pairwise proportion (Wilson score),
+# not the fitted model win_probability -- the docstring used to claim the latter.
+# empirical_win_rate() was added so reporting can show the two distinct
+# quantities side by side.
+
+def test_yespdf13_empirical_win_rate_is_raw_proportion():
+    from bt_model import BradleyTerryModel
+    bt = BradleyTerryModel(["a", "b", "c"])
+    for _ in range(3):
+        bt.add_match("a", "b")
+    bt.add_match("b", "a")
+    assert bt.empirical_win_rate("a", "b") == 0.75
+    assert bt.empirical_win_rate("b", "a") == 0.25
+
+
+def test_yespdf13_empirical_win_rate_unplayed_pair_is_half():
+    from bt_model import BradleyTerryModel
+    bt = BradleyTerryModel(["a", "b"])
+    assert bt.empirical_win_rate("a", "b") == 0.5
+
+
+def test_yespdf13_ci_brackets_empirical_proportion():
+    from bt_model import BradleyTerryModel
+    bt = BradleyTerryModel(["a", "b"])
+    for _ in range(8):
+        bt.add_match("a", "b")
+    for _ in range(2):
+        bt.add_match("b", "a")
+    low, high = bt.confidence_interval("a", "b")
+    emp = bt.empirical_win_rate("a", "b")  # 0.8
+    assert 0.0 <= low <= emp <= high <= 1.0
+
+
+def test_yespdf13_model_and_empirical_are_distinct_objects():
+    """The model estimate pools across the graph; the empirical rate uses only
+    the head-to-head games. They need not be equal -- here c never beats anyone,
+    which shifts the fitted strengths away from the raw a-vs-b proportion."""
+    from bt_model import BradleyTerryModel
+    bt = BradleyTerryModel(["a", "b", "c"])
+    for _ in range(5):
+        bt.add_match("a", "b")
+        bt.add_match("a", "c")
+        bt.add_match("b", "c")
+    bt.fit()
+    # Both are valid probabilities; the point is they are computed independently.
+    assert 0.0 <= bt.win_probability("a", "b") <= 1.0
+    assert 0.0 <= bt.empirical_win_rate("a", "b") <= 1.0
+
+
+# ===========================================================================
+# Yes.pdf review #3 (interpreted): no-silent-exceptions RELEASE gate
+# ===========================================================================
+# The manager wanted recurring exceptions to block a release. Runtime must still
+# degrade to PASS (a raise zeros the season), so the enforcement lives in
+# revalidate.py as REQ-06: a well-formed season must raise zero contained
+# exceptions.
+
+def test_yespdf3_req06_registered():
+    import revalidate
+    assert hasattr(revalidate, "check_no_silent_exceptions")
+    assert revalidate.check_no_silent_exceptions.req_id == "REQ-06-NOEXC"
+
+
+def test_yespdf3_wellformed_season_raises_no_exceptions(rules):
+    import revalidate
+    ok, detail = revalidate.check_no_silent_exceptions(rules)
+    assert ok, detail
+

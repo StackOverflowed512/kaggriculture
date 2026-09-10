@@ -7,7 +7,8 @@ rather than simply maximizing expected terminal cash.
 This module provides the statistical machinery to compute:
     1. Maximum-Likelihood Estimation (MLE) of agent strengths from a win/loss matrix.
     2. Pairwise win probabilities based on those strengths.
-    3. Robust confidence intervals around those probabilities.
+    3. The raw empirical head-to-head win rate, and a Wilson score confidence
+       interval around *that observed proportion* (not the model estimate).
 """
 
 import math
@@ -74,10 +75,30 @@ class BradleyTerryModel:
                 break
 
     def win_probability(self, agent_a, agent_b):
-        """Probability that agent_a beats agent_b."""
+        """Model estimate: P(agent_a beats agent_b) from fitted latent strengths.
+
+        This is the Bradley-Terry model's smoothed estimate, which pools
+        information across the whole tournament graph -- distinct from the raw
+        head-to-head proportion (see :meth:`empirical_win_rate`).
+        """
         i = self.agent_to_idx[agent_a]
         j = self.agent_to_idx[agent_b]
         return self.strengths[i] / (self.strengths[i] + self.strengths[j])
+
+    def empirical_win_rate(self, agent_a, agent_b):
+        """Raw head-to-head proportion: (a's wins over b) / (games a vs b).
+
+        Returns 0.5 when the pair never met.  This is the direct observed
+        frequency -- the quantity :meth:`confidence_interval` brackets -- and it
+        deliberately does NOT use the fitted strengths, so callers can show the
+        model estimate and the empirical proportion side by side.
+        """
+        i = self.agent_to_idx[agent_a]
+        j = self.agent_to_idx[agent_b]
+        n_matches = self.N[i][j]
+        if n_matches == 0:
+            return 0.5
+        return self.W[i][j] / n_matches
 
     def get_summary(self):
         """Return a sorted list of (agent, strength)."""
@@ -88,21 +109,25 @@ class BradleyTerryModel:
         )
 
     def confidence_interval(self, agent_a, agent_b, z=1.96):
+        """Wilson score interval for the *empirical* pairwise win rate of A vs B.
+
+        NOTE: this brackets the observed head-to-head proportion
+        (:meth:`empirical_win_rate`), NOT the model's fitted
+        :meth:`win_probability`.  For the small match counts a Monte-Carlo
+        sweep produces, a Wilson score interval on the direct pairwise records
+        is more honest than an asymptotic-normal interval on the MLE, which
+        would assume a sample size we do not have.  The two quantities differ:
+        the model estimate pools information across the whole tournament graph,
+        while this interval uses only the A-vs-B games.
         """
-        Calculate a robust confidence interval for the win probability of A vs B
-        using asymptotic variance of the MLE.
-        """
-        # For small MC samples, a simple binomial proportion CI (Wilson score)
-        # on the direct pairwise match records is more robust than assuming
-        # independence of overall cash variance.
         i = self.agent_to_idx[agent_a]
         j = self.agent_to_idx[agent_b]
         wins_a = self.W[i][j]
         n_matches = self.N[i][j]
-        
+
         if n_matches == 0:
             return (0.0, 1.0)
-            
+
         p_hat = wins_a / n_matches
         # Wilson score interval for binomial proportion
         denominator = 1 + z**2 / n_matches
