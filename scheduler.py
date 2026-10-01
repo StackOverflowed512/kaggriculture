@@ -28,6 +28,51 @@ from market_model import MarketModel
 SHED_TILES = ((4, 4), (5, 4), (4, 5), (5, 5))
 
 
+class TurnLedger:
+    """Single mutable projection of the shed across one turn's planning stages.
+
+    Fixes the stale-state divergence (#4): ``main.py`` builds one ledger per
+    turn and threads it through the market-order stage *and* the worker-
+    assignment stage, so every planner reads the same post-order shed
+    projection.  A fertilizer/animal BUY placed in the morning raises the
+    projection that the later DROP pre-emption sees, instead of each stage
+    recomputing from an independent observation snapshot that predates the
+    orders actually emitted.
+
+    It also carries the turn's *named* reservations (#10) so unrelated concerns
+    stop sharing one anonymous integer:
+        ``shed_projected`` -- items expected to occupy the shed after this
+                              turn's buys (physical stock + incoming purchases).
+        ``feed_reserved``  -- shed stock held back from selling to feed placed
+                              animals (#6); an item -> qty map.
+    Sells are intentionally NOT credited back: the physical goods still occupy
+    the shed until the engine settles the order, so keeping them counted keeps
+    the DROP/overflow logic conservative against a spill.
+    """
+
+    __slots__ = ("shed_projected", "feed_reserved")
+
+    def __init__(self, shed_usage=0, feed_reserved=None):
+        self.shed_projected = shed_usage
+        self.feed_reserved = dict(feed_reserved) if feed_reserved else {}
+
+    def commit_buy(self, qty=1):
+        """Record ``qty`` bought units arriving into the shed this turn."""
+        if qty and qty > 0:
+            self.shed_projected += qty
+        return self.shed_projected
+
+    def reserve_feed(self, item, qty):
+        """Hold ``qty`` of ``item`` back from selling (animal feed, #6/#10)."""
+        if qty and qty > 0:
+            self.feed_reserved[item] = self.feed_reserved.get(item, 0) + qty
+
+    @property
+    def usage(self):
+        """The projected shed occupancy the assignment stage should plan on."""
+        return self.shed_projected
+
+
 def manhattan(a, b):
     """Manhattan (taxicab) distance between two ``(x, y)`` positions."""
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
@@ -53,6 +98,44 @@ def step_towards(pos, target):
 def nearest_shed_tile(pos):
     """Return the closest shed centre tile to ``pos`` (deterministic on ties)."""
     return min(SHED_TILES, key=lambda tile: manhattan(pos, tile))
+
+
+def turn_phase(step, rules):
+    """Single source of temporal truth for a turn (#20).
+
+    Consolidates the ``step``-arithmetic gates that previously lived inline and
+    duplicated across ``main.py`` and the scheduler (hour-of-day, day index,
+    season length in days, and the endgame window).  Keeping them in one
+    documented helper means the day/dawn/endgame boundaries are defined once and
+    cannot drift between the live agent and the offline checks.
+
+    Returns a plain dict:
+        hour:         step within the current day (0 == dawn roll-over)
+        day:          0-indexed day number
+        hours_per_day / season_length / season_days
+        in_endgame:   step has reached ``policy.endgame_start_turn``
+        is_dawn:      hour == 0
+        is_last_hour: hour == hours_per_day - 1
+
+    (Per-crop *watering windows* remain data in ``crop_params`` -- they are not
+    step-derived, so they stay where the crop rules live rather than here.)
+    """
+    constants = rules.get("constants", {}) if rules else {}
+    policy = rules.get("policy", {}) if rules else {}
+    hours_per_day = constants.get("hours_per_day", 24)
+    season_length = constants.get("season_length", 720)
+    endgame_start = policy.get("endgame_start_turn", 670)
+    hour = step % hours_per_day
+    return {
+        "hour": hour,
+        "day": step // hours_per_day,
+        "hours_per_day": hours_per_day,
+        "season_length": season_length,
+        "season_days": season_length // hours_per_day,
+        "in_endgame": step >= endgame_start,
+        "is_dawn": hour == 0,
+        "is_last_hour": hour == hours_per_day - 1,
+    }
 
 
 def _hungarian(costs):
@@ -207,11 +290,16 @@ class Scheduler:
         # turn: "normal" (80%), "overflow" (half shed, e.g. end of day), or
         # "endgame" (0 -- liquidate every load).
         self.drop_mode = "normal"
+        # Per-turn memo for _choose_plant_crop (#12): a single (key, result)
+        # pair keyed on (step, market-stock signature).  A new turn's key misses
+        # and recomputes, so the cached value can never go stale.
+        self._plant_choice_cache = None
 
     # ------------------------------------------------------------------ #
     # Task generation
     # ------------------------------------------------------------------ #
-    def generate_tasks(self, obs, rules, care_capacity, market_stocks=None):
+    def generate_tasks(self, obs, rules, care_capacity, market_stocks=None,
+                       num_workers=None):
         """Scan the board and return a list of prioritized ``Task`` objects.
 
         ``obs`` is a plain dict describing the board this turn. Recognised keys
@@ -224,6 +312,13 @@ class Scheduler:
             weeds:         list of ``(x, y)`` tiles to dig out.
             empty_tiles:   list of plantable ``(x, y)`` tiles.
             market_stocks: dict of item -> current market inventory.
+
+        ``num_workers`` (optional) is the size of the crew this turn.  When
+        given, it bounds new planting by crew throughput (#21): a crop must be
+        watered roughly daily, so the sustainable acreage is capped at
+        ``num_workers * care_policy.max_crops_per_worker``.  When None (the
+        offline checks and unit tests that only exercise the CareMonitor bound)
+        no crew cap is applied, preserving the prior behaviour.
         """
         dr = rules.get("daily_routines", {})
         policy = rules.get("policy", {})
@@ -261,6 +356,11 @@ class Scheduler:
                         crop=ctype,
                     )
                 )
+                # Per-tile dedupe (#11): a ripe crop is harvested this turn, not
+                # watered. Emitting a WATER for the same tile would compete for a
+                # worker and, if won, waste the action on a crop that is about to
+                # be removed by the harvest. One tile -> one crop task per turn.
+                continue
 
             water_priority = self._water_priority(crop, dr["WATER"], to_die, is_repeater)
             if water_priority is not None:
@@ -270,10 +370,33 @@ class Scheduler:
         for weed in weeds:
             tasks.append(Task("DIG", tuple(weed), dr["DIG"]["priority"]))
 
+        # --- Animal lifecycle tasks (computed up front for the #13 gate) -----
+        # Built here (not appended last) so the planting stage below can see
+        # whether any animal home still needs BUILDing this turn.  When animals
+        # are disabled this is an empty list and nothing downstream changes.
+        animal_tasks = self._animal_tasks(obs, rules) if animals_on else []
+        infra_pending = any(t.kind.startswith("BUILD_") for t in animal_tasks)
+
         # --- Planting (within capacity + cash test) + same-day watering ------
+        # PLANT-vs-infrastructure arbitration (#13): while an animal home is
+        # still unbuilt, suppress speculative new planting so the crew commits
+        # to raising the COOP/PASTURE first instead of splitting effort between
+        # breaking ground and starting crops that will then compete for water.
+        # Gated behind ANIMALS_ENABLED via ``infra_pending`` -- with animals off
+        # this is always False and planting is unchanged.
         plant_crop = self._choose_plant_crop(rules, step, market_stocks)
-        if plant_crop is not None:
-            free_slots = max(0, care_capacity - len(crops))
+        if plant_crop is not None and not infra_pending:
+            effective_cap = care_capacity
+            if num_workers is not None:
+                # Crew-throughput bound (#21): a standing crop needs servicing
+                # (watering) roughly daily, so the number a crew can sustain is
+                # capped by ``care_policy.max_crops_per_worker`` per worker.  We
+                # take the tighter of that ceiling and the CareMonitor's
+                # (slower-moving) acreage target so we never plant more than the
+                # crew can actually keep alive.
+                per_worker = rules.get("care_policy", {}).get("max_crops_per_worker", 8)
+                effective_cap = min(care_capacity, num_workers * per_worker)
+            free_slots = max(0, effective_cap - len(crops))
             for tile in empty_tiles[:free_slots]:
                 pos = tuple(tile)
                 tasks.append(Task("PLANT", pos, dr["PLANT"]["priority"], crop=plant_crop))
@@ -297,11 +420,10 @@ class Scheduler:
 
         # --- Animal chores are skipped entirely while animals are disabled ---
         # (Prevention, not post-hoc filtering -- see design doc guardrails.)
-        # When enabled, _animal_tasks walks each animal's lifecycle stage and
-        # emits HARVEST_ANIMAL (9100), FEED (8800), CARE (4000), plus the setup
-        # BUILD_* / PLACE work.
-        if animals_on:
-            tasks.extend(self._animal_tasks(obs, rules))
+        # When enabled, _animal_tasks (computed above) walks each animal's
+        # lifecycle stage and emits HARVEST_ANIMAL (9100), FEED (8800),
+        # CARE (4000), plus the setup BUILD_* / PLACE work.
+        tasks.extend(animal_tasks)
 
         return tasks
 
@@ -329,7 +451,27 @@ class Scheduler:
         animal_params = rules.get("animal_params", {})
         animals = obs.get("animals") or []
         market_stocks = obs.get("market_stocks") or {}
+        shed = obs.get("shed") or {}
         tasks = []
+
+        # #14: per-turn WHEAT pickup reservation for FEED.  Each FEED fetches
+        # one wheat from the shed; when the shed holds SOME wheat but fewer
+        # units than the unfed placed flock needs, ration the known supply so we
+        # never dispatch more simultaneous wheat-pickups than there is wheat to
+        # pick up (empty-handed PICKUPs waste worker-turns and show up as wasted
+        # actions in the audit).  A reported-empty shed (0 wheat) is treated as
+        # "supply unknown / incoming" and does NOT suppress the need-driven FEED
+        # task -- feeding stays a need the routing satisfies once wheat arrives.
+        feed_per_animal = rules.get("animal_policy", {}).get("feed_per_animal", 1)
+        wheat_available = int(shed.get("WHEAT", 0) or 0)
+        unfed = sum(1 for a in animals
+                    if a.get("placed", False) and not a.get("fed_today", False)
+                    and animal_params.get(a.get("type")) and a.get("home_pos") is not None)
+        feed_budget = None
+        if wheat_available > 0:
+            feedable = wheat_available // max(1, feed_per_animal)
+            if feedable < unfed:
+                feed_budget = feedable
 
         for animal in animals:
             atype = animal.get("type")
@@ -372,8 +514,13 @@ class Scheduler:
                     )
                 )
             if not animal.get("fed_today", False):
-                # Feeding needs one wheat carried from the shed first.
-                tasks.append(Task("FEED", home, dr["FEED"]["priority"], crop=atype, fetch="WHEAT"))
+                # Feeding needs one wheat carried from the shed first.  Respect
+                # the per-turn wheat ration (#14): emit until the known supply
+                # is spent; feed_budget is None when supply is ample or unknown.
+                if feed_budget is None or feed_budget > 0:
+                    tasks.append(Task("FEED", home, dr["FEED"]["priority"], crop=atype, fetch="WHEAT"))
+                    if feed_budget is not None:
+                        feed_budget -= 1
             if animal.get("needs_care", False):
                 tasks.append(Task("CARE", home, dr["CARE"]["priority"], crop=atype))
 
@@ -382,30 +529,36 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     # Market order generation (purchases)
     # ------------------------------------------------------------------ #
-    def generate_market_orders(self, obs, rules, shed_usage=0):
+    def generate_market_orders(self, obs, rules, shed_usage=0, ledger=None):
         """Return the ``BUY_PRODUCT`` market orders to place this turn.
 
         These are engine ``market`` orders (plain lists), emitted alongside the
         morning HIRE/SELL routine in ``main.py``. Purchasing is disabled during
         endgame liquidation (the caller simply does not call us then), so the
         only concern here is the 100-item shed capacity: bought goods land in
-        the shed, so we never order more than would fit. ``shed_usage`` is the
-        current shed count; we track a running projection as orders accumulate
-        so a batch of buys never overshoots the shed together.
+        the shed, so we never order more than would fit.
+
+        The shed projection is tracked in a shared ``TurnLedger`` (#4): when the
+        caller threads one in, each buy we commit raises the projection that the
+        later worker-assignment DROP stage also reads, so both stages plan from
+        the same post-order state.  When no ledger is supplied we build a local
+        one seeded from ``shed_usage`` (backward-compatible with the audit and
+        unit-test call sites), which behaves exactly as the old running integer.
 
         ``BUY_PRODUCT`` is a single opcode; the item (``"FERTILIZER"``, or an
         animal type in Phase 4 step 2) is an argument, never a separate op.
         """
         policy = rules.get("policy", {})
-        projected_usage = shed_usage
+        if ledger is None:
+            ledger = TurnLedger(shed_usage)
         orders = []
 
         # --- Fertilizer -----------------------------------------------------
         if policy.get("FERTILIZER_ENABLED", False):
-            qty = self._fertilizer_buy_qty(obs, rules, projected_usage)
+            qty = self._fertilizer_buy_qty(obs, rules, ledger.shed_projected)
             if qty > 0:
                 orders.append(["BUY_PRODUCT", "FERTILIZER", qty])
-                projected_usage += qty
+                ledger.commit_buy(qty)
 
         # --- Animals: buy an animal once its home is built and it is not yet
         # owned. A bought animal arrives in the shed, so it takes one shed slot
@@ -413,31 +566,93 @@ class Scheduler:
         if policy.get("ANIMALS_ENABLED", False):
             shed_size = rules.get("constants", {}).get("shed_size", 100)
             animal_params = rules.get("animal_params", {})
-            for animal in (obs.get("animals") or []):
+            animals = obs.get("animals") or []
+            shed = obs.get("shed") or {}
+            feed_per_animal = rules.get("animal_policy", {}).get("feed_per_animal", 1)
+
+            # Feed-coverage bootstrap gate (#3): only expand the flock when the
+            # wheat on hand already covers a day's feed for every *placed*
+            # animal.  Scoping the requirement to PLACED animals is deliberate:
+            # an unplaced animal eats nothing yet, so the very first animal can
+            # always be bought to bootstrap the economy even with an empty shed
+            # (the feed gets bought/grown before it is placed).  Once animals
+            # are producing, we stop buying more than we can feed.
+            placed_count = sum(1 for a in animals if a.get("placed", False))
+            wheat_on_hand = shed.get("WHEAT", 0) or 0
+            feed_covered = wheat_on_hand >= feed_per_animal * placed_count
+
+            # Per-home occupancy for the capacity gate (#7): how many animals are
+            # already committed (owned or placed) to each home tile, so a buy
+            # never over-fills a COOP/PASTURE beyond ``_home_capacity``.
+            committed_per_home = {}
+            for a in animals:
+                if a.get("owned", False) or a.get("placed", False):
+                    hp = a.get("home_pos")
+                    if hp is not None:
+                        key = tuple(hp)
+                        committed_per_home[key] = committed_per_home.get(key, 0) + 1
+
+            for animal in animals:
                 atype = animal.get("type")
-                if atype not in animal_params:
+                params = animal_params.get(atype)
+                if params is None:
                     continue
-                if (animal.get("home_built", False)
-                        and not animal.get("owned", False)
-                        and projected_usage + 1 <= shed_size):
+                if not animal.get("home_built", False) or animal.get("owned", False):
+                    continue
+                if not feed_covered:
+                    continue  # #3: don't buy what the placed flock can't be fed alongside
+                hp = animal.get("home_pos")
+                home_cap = self._home_capacity(rules, params.get("home"))
+                key = tuple(hp) if hp is not None else None
+                if key is not None and committed_per_home.get(key, 0) >= home_cap:
+                    continue  # #7: the home is already full
+                if ledger.shed_projected + 1 <= shed_size:
                     orders.append(["BUY_PRODUCT", atype])
-                    projected_usage += 1
+                    ledger.commit_buy(1)
+                    if key is not None:
+                        committed_per_home[key] = committed_per_home.get(key, 0) + 1
 
         return orders
 
     @staticmethod
-    def _sell_orders(shed, rules=None, endgame=False, market_stocks=None):
+    def _home_capacity(rules, home_type):
+        """Maximum animals a home of ``home_type`` can hold.
+
+        Single source of truth (#7) read by both the buy limit above and any
+        PLACE gating: reads ``animal_policy.home_capacity`` (COOP/PASTURE) and
+        falls back to ``default_home_capacity`` so an unrecognised home type
+        still yields a finite, sane cap rather than unbounded placement.
+        """
+        animal_policy = rules.get("animal_policy", {})
+        caps = animal_policy.get("home_capacity", {})
+        default = animal_policy.get("default_home_capacity", 4)
+        return caps.get(home_type, default)
+
+    @staticmethod
+    def _sell_orders(shed, rules=None, endgame=False, market_stocks=None, reserve=None):
         """A SELL order for shed items that should be sold this turn.
 
         Only items with a ``market_params`` entry are considered -- inputs like
         FERTILIZER or an unbought animal type are not sellable products.
 
-        During normal play, premium goods (normal_price ≥ 100) are held when
-        their current market price has collapsed below 50% of normal, because
-        selling into a crashed market destroys optionality.  Basic goods
-        (normal_price < 100) are always sold -- their price curves are gentle
-        enough that holding provides no meaningful upside, and they clog the
-        shed.
+        During normal play, premium goods (normal_price >=
+        ``market_heuristics.premium_price_threshold``) are held when their
+        current market price has collapsed below
+        ``market_heuristics.depressed_price_fraction`` of normal, because
+        selling into a crashed market destroys optionality.  Basic goods are
+        always sold -- their price curves are gentle enough that holding
+        provides no meaningful upside, and they clog the shed.  Both dials are
+        read from the rule table (#6) rather than hard-coded so they are tuned
+        in data alone.
+
+        ``reserve`` (item -> qty) is stock held back from selling this turn --
+        e.g. WHEAT kept to feed the placed flock (#6).  Reserved units are
+        subtracted from the sellable quantity before an order is built.
+
+        Orders are returned ranked by projected sale revenue, highest first
+        (#5): under the engine's 10-order cap the most valuable liquidations are
+        then the ones guaranteed to survive truncation.  Ties break on item
+        name for determinism.
 
         During endgame, everything is liquidated regardless of price -- there
         is no future to hold for.
@@ -445,7 +660,9 @@ class Scheduler:
         if not shed:
             return []
         market = rules.get("market_params", {}) if rules else {}
-        constants = rules.get("constants", {}) if rules else {}
+        heuristics = rules.get("market_heuristics", {}) if rules else {}
+        premium_threshold = heuristics.get("premium_price_threshold", 100)
+        depressed_fraction = heuristics.get("depressed_price_fraction", 0.5)
         orders = []
         for item, qty in shed.items():
             if not qty or int(qty) <= 0:
@@ -453,26 +670,37 @@ class Scheduler:
             if market is not None and item not in market:
                 continue
             qty = int(qty)
+            # Hold back any reserved units (animal feed, #6) before selling.
+            if reserve:
+                qty -= int(reserve.get(item, 0) or 0)
+                if qty <= 0:
+                    continue
             if not endgame and market is not None:
                 params = market.get(item, {})
                 normal_price = params.get("normal_price", 0)
                 # For premium goods, check whether the current price is
-                # depressed.  We approximate current stock as 0 (we don't have
-                # market_stocks here) so this is a conservative check -- if
-                # even at zero stock the price would be low, the market is
-                # truly crashed and we hold.  In practice main.py passes
-                # market_stocks via daily_market_orders, but _sell_orders is
-                # also called from the audit path; the endgame path always
-                # sells everything anyway.
-                if normal_price >= 100:
+                # depressed.  When market_stocks is unavailable (the audit
+                # path) we approximate current stock as 0 -- a conservative
+                # check: if even at zero stock the price is already below the
+                # depressed fraction, the market is truly crashed and we hold.
+                if normal_price >= premium_threshold:
                     stock = market_stocks.get(item, 0) if market_stocks else 0
                     live_price = MarketModel.market_price(rules, item, stock)
-                    if live_price < normal_price * 0.5:
+                    if live_price < normal_price * depressed_fraction:
                         continue  # hold -- price is depressed
             orders.append(["SELL", item, qty])
+        # Revenue-rank (#5): sell the most valuable inventory first so the
+        # 10-order engine cap never drops a high-value liquidation in favour of
+        # a cheap one.  Deterministic tie-break on item name.
+        if rules and len(orders) > 1:
+            def _revenue(order):
+                _op, oitem, oqty = order
+                stock = market_stocks.get(oitem, 0) if market_stocks else 0
+                return MarketModel.avg_price(rules, oitem, stock, oqty) * oqty
+            orders.sort(key=lambda o: (-_revenue(o), o[1]))
         return orders
 
-    def daily_market_orders(self, state, rules, hour, in_endgame, shed_usage=0):
+    def daily_market_orders(self, state, rules, hour, in_endgame, shed_usage=0, ledger=None):
         """The full ordered market plan for one turn.
 
         Encodes the handover's morning-then-overlay ladder in one place so both
@@ -490,16 +718,36 @@ class Scheduler:
         Orders are returned uncapped; the ``ActionEmitter`` applies the 10-order
         engine cap at emission.  Placing SELL before HIRE ensures that the
         10-order cap never starves the morning sell when ``target_hands`` is 10.
+
+        A ``TurnLedger`` may be threaded in (#4) so the buys emitted here raise
+        the shed projection the caller later hands to ``assign_tasks``; when
+        absent one is built locally from ``shed_usage`` (unchanged behaviour for
+        the audit / unit-test call sites).
         """
         policy = rules.get("policy", {}) if rules else {}
         shed = state.get("shed") or {}
         market_stocks = state.get("market_stocks") or {}
-        orders = []
+        if ledger is None:
+            ledger = TurnLedger(shed_usage)
         max_orders = rules.get("constants", {}).get("max_market_orders", 10) if rules else 10
+
+        # Reserve WHEAT to feed the placed flock (#6/#10) so feed stock is not
+        # sold out from under animals that still need it.  Gated + endgame-off:
+        # with animals disabled there are no placed animals (nothing reserved),
+        # and endgame liquidates everything regardless, so selling is unchanged.
+        if policy.get("ANIMALS_ENABLED", False) and not in_endgame:
+            animals = state.get("animals") or []
+            placed = sum(1 for a in animals if a.get("placed", False))
+            feed_per_animal = rules.get("animal_policy", {}).get("feed_per_animal", 1)
+            ledger.reserve_feed("WHEAT", placed * feed_per_animal)
+
+        orders = []
         if hour == 0:
             # Sell first -- the harvest must be banked before market slots are
             # spent on hiring.  Hiring fills whatever slots remain.
-            sell = self._sell_orders(shed, endgame=in_endgame, rules=rules, market_stocks=market_stocks)
+            sell = self._sell_orders(shed, endgame=in_endgame, rules=rules,
+                                     market_stocks=market_stocks,
+                                     reserve=ledger.feed_reserved)
             orders.extend(sell)
             if not in_endgame:
                 hire_slots = max(0, max_orders - len(sell))
@@ -507,9 +755,12 @@ class Scheduler:
                 for _ in range(min(target, hire_slots)):
                     orders.append(["HIRE"])
         if not in_endgame:
-            orders.extend(self.generate_market_orders(state, rules, shed_usage=shed_usage))
+            orders.extend(self.generate_market_orders(
+                state, rules, shed_usage=ledger.shed_projected, ledger=ledger))
         elif hour != 0:
-            orders.extend(self._sell_orders(shed, endgame=True, rules=rules, market_stocks=market_stocks))
+            orders.extend(self._sell_orders(shed, endgame=True, rules=rules,
+                                            market_stocks=market_stocks,
+                                            reserve=ledger.feed_reserved))
         return orders
 
     # ------------------------------------------------------------------ #
@@ -554,6 +805,36 @@ class Scheduler:
             else:
                 free.append(worker)
 
+        # 1.5) Carry-lock (#9): a worker already carrying a fetch item is pinned
+        # to the nearest task that needs exactly that item and removed from band
+        # matching, so a higher-priority band cannot pull it away mid-transport
+        # and strand the carried animal / wheat.  Only fires when a task
+        # actually wants the carried item; a carried item matching no task falls
+        # through to normal matching (where _task_action's wrong-item
+        # DROP-before-PICKUP rule handles it).  ``carrying_item`` is only ever
+        # set in the animal fetch/feed flows, so this is inert with animals off.
+        locked_tasks = set()
+        still_free = []
+        for worker in free:
+            item = worker.get("carrying_item")
+            if not item:
+                still_free.append(worker)
+                continue
+            wpos = tuple(worker["pos"])
+            best = None
+            for i, t in enumerate(tasks):
+                if i in locked_tasks or t.fetch != item:
+                    continue
+                d = manhattan(wpos, t.pos)
+                if best is None or d < best[0]:
+                    best = (d, i, t)
+            if best is not None:
+                locked_tasks.add(best[1])
+                actions[worker["id"]] = self._task_action(worker, best[2])
+            else:
+                still_free.append(worker)
+        free = still_free
+
         # 2) Re-band same-day watering just below PLANT ----------------------
         # Same-day water tasks were created at priority_dying (9500) so they
         # would outrank other work, but they must be assigned *after* the
@@ -564,7 +845,9 @@ class Scheduler:
         plant_priority = rules.get("daily_routines", {}).get("PLANT", {}).get("priority", 6000)
         plant_cells = {t.pos for t in tasks if t.kind == "PLANT"}
         active = []
-        for t in tasks:
+        for i, t in enumerate(tasks):
+            if i in locked_tasks:
+                continue  # already claimed by a carrying worker (#9)
             if t.same_day and t.pos in plant_cells:
                 # Demote to just below PLANT so it's assigned after planting.
                 active.append(Task(t.kind, t.pos, plant_priority - 1,
@@ -574,16 +857,23 @@ class Scheduler:
             else:
                 active.append(t)
 
-        # 3) Greedy Manhattan matching, band by band -------------------------
+        # 3) Optimal Manhattan matching, band by band -----------------------
+        # Bands are grouped by *priority only* (#22/#23): every task sharing an
+        # urgency band competes for the same workers, and their relative
+        # economic value is folded into the assignment cost inside _match_band
+        # rather than split into value sub-bands.  A short-handed crew then
+        # serves the high-value tasks in a band and skips the low-value ones,
+        # while value never crosses an urgency boundary (priority still wins).
         active.sort(key=Task.sort_key, reverse=True)
+        value_weight = rules.get("routing_policy", {}).get("value_weight", 0.0)
         idx, count = 0, len(active)
         while idx < count and free:
-            band_key = active[idx].sort_key()
+            band_priority = active[idx].priority
             band = []
-            while idx < count and active[idx].sort_key() == band_key:
+            while idx < count and active[idx].priority == band_priority:
                 band.append(active[idx])
                 idx += 1
-            self._match_band(free, band, actions)
+            self._match_band(free, band, actions, value_weight=value_weight)
 
         # 4) Idle workers pass ----------------------------------------------
         for worker in free:
@@ -591,16 +881,25 @@ class Scheduler:
 
         return actions
 
-    def _match_band(self, free, band, actions):
+    def _match_band(self, free, band, actions, value_weight=0.0):
         """Assign workers to tasks within one band by optimal minimum-cost
         bipartite matching (Hungarian algorithm).
 
-        Minimises the total Manhattan distance across all worker-task pairs in
-        the band, which is the optimal assignment the design doc requires.  The
-        previous greedy approach could produce sub-optimal total walking (e.g.
-        W1→T1=1, W2→T2=100 instead of W1→T2=2, W2→T1=2).  Implemented in pure
-        Python (no scipy/numpy) so the Kaggle image has no extra dependency.
-        Mutates ``free`` (removing assigned workers) and ``actions``.
+        Minimises the total cost across all worker-task pairs in the band.  The
+        base cost is Manhattan distance; when ``value_weight`` > 0 an economic
+        term ``value_weight * (vmax - task.value)`` is added so higher-value
+        tasks are cheaper (#22/#23).  Crucially this term is a *per-task
+        column constant*: when workers >= tasks every task is assigned exactly
+        once, so the added constants sum the same for every complete matching
+        and the optimal assignment is identical to pure distance.  It changes
+        the result only when the band is short-handed (tasks > workers), where
+        it decides *which* low-value tasks get left undone this turn -- exactly
+        the delay-consequence sub-ranking the manager asked for.
+
+        The term stays non-negative (``value_weight`` >= 0 and ``vmax`` is the
+        band maximum, so ``vmax - value`` >= 0), which the ``_hungarian`` BIG
+        sentinel requires.  Pure Python (no scipy/numpy).  Mutates ``free``
+        (removing assigned workers) and ``actions``.
         """
         if not free or not band:
             return
@@ -608,9 +907,12 @@ class Scheduler:
         nw = len(free)
         nt = len(band)
 
-        # Build the cost matrix (Manhattan distances).  Rows = workers,
-        # cols = tasks.  We minimise total distance.
+        # Build the cost matrix.  Rows = workers, cols = tasks.  Base term is
+        # Manhattan distance; the value fold (see docstring) breaks ties toward
+        # richer/more-urgent tasks under contention without ever going negative.
+        vmax = max((t.value for t in band), default=0.0)
         costs = [[manhattan(tuple(free[wi]["pos"]), band[ti].pos)
+                  + value_weight * (vmax - band[ti].value)
                   for ti in range(nt)] for wi in range(nw)]
 
         # The Hungarian algorithm finds the minimum-cost assignment.  For the
@@ -746,29 +1048,50 @@ class Scheduler:
 
     def _choose_plant_crop(self, rules, step, market_stocks):
         """Best-EV crop that can still be harvested and sold before the season
-        ends, or None if nothing passes the cash test (then we plant nothing)."""
-        ranked = MarketModel.crop_values(rules, market_stocks or {})
+        ends, or None if nothing passes the cash test (then we plant nothing).
+
+        Memoized per (step, market-stock signature) (#12): the crop-EV ranking
+        and the cash test are pure functions of the turn's step and market
+        stocks, so re-entering ``generate_tasks`` within a turn should not repeat
+        the ``crop_values`` sort.  The cache holds a single (key, result) pair;
+        a new turn's key misses and recomputes, so the result is never stale."""
+        stocks = market_stocks or {}
+        key = (step, tuple(sorted(stocks.items())))
+        cached = self._plant_choice_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        ranked = MarketModel.crop_values(rules, stocks)
+        result = None
         for ctype in ranked:
             if self._can_finish(ctype, rules, step):
-                return ctype
-        return None
+                result = ctype
+                break
+        self._plant_choice_cache = (key, result)
+        return result
 
     @staticmethod
     def _can_finish(ctype, rules, step):
-        """Planting cash test: can this crop mature (and leave a day to sell)
-        before turn 720? Cutoff day = season_days - grow_days - 1, which
-        reproduces the handover's carrot 26 / wheat 25 / melon 19 cutoffs."""
+        """Planting cash test: can this crop mature (and leave time to sell)
+        before turn 720?
+
+        Cutoff day = ``season_days - grow_days - sell_days_buffer``.  The
+        sell buffer is read from ``constants.sell_days_buffer`` (default 1, the
+        handover value) rather than a hard-coded ``-1`` (#24), so the days
+        reserved to liquidate the final harvest are tunable in data alone.  At
+        the default buffer of 1 this reproduces the handover's carrot 26 /
+        wheat 25 / melon 19 cutoffs exactly."""
         params = rules.get("crop_params", {}).get(ctype)
         if not params:
             return False
-        hours_per_day = rules.get("constants", {}).get("hours_per_day", 24)
-        season_days = rules.get("constants", {}).get("season_length", 720) // hours_per_day
-        day = step // hours_per_day
+        phase = turn_phase(step, rules)
+        season_days = phase["season_days"]
+        day = phase["day"]
+        sell_buffer = rules.get("constants", {}).get("sell_days_buffer", 1)
         if params.get("type") == "repeater":
             grow_days = params.get("first_fruit", season_days)
         else:
             grow_days = params.get("full_harvest", season_days)
-        return day <= season_days - grow_days - 1
+        return day <= season_days - grow_days - sell_buffer
 
     def _drop_threshold(self, rules, mode):
         """Item count above which a carrying worker is sent to the shed.

@@ -222,6 +222,40 @@ def check_no_silent_exceptions(rules):
     return True, f"{len(steps)} well-formed turns raised zero contained exceptions"
 
 
+@requirement("REQ-07-CAPTURE")
+def check_exception_capture_completeness():
+    """Every contained exception is captured *completely* in telemetry.
+
+    Containment (REQ-02) only asserts the wrapper degrades to PASS and bumps the
+    counter.  This goes further: each contained exception must leave a
+    fully-populated telemetry record -- the running count, a log entry whose
+    ``exception`` holds the real traceback text, and the triage tags
+    (``type`` / ``category``) -- so a post-season audit can classify failures
+    instead of reading a bare number.  A swallowed-but-unlogged exception would
+    be invisible to the release gate, exactly the recurring-exception blind spot
+    the manager flagged.  The by-category aggregate must also sum to the count,
+    so no captured exception escapes classification.
+    """
+    agent = _fresh_agent()
+    before = agent.telemetry.get_exception_count()
+    out = agent({"step": 5, "crops": "not-a-list", "workers": 123}, {})
+    if out != {"farmer": [], "hands": [], "market": []}:
+        return False, f"did not degrade to PASS: {out}"
+    log = agent.telemetry.exceptions_log
+    if agent.telemetry.get_exception_count() != before + 1 or not log:
+        return False, "contained exception not recorded in the telemetry log"
+    entry = log[-1]
+    missing = [k for k in ("step", "type", "category", "exception") if k not in entry]
+    if missing:
+        return False, f"telemetry entry missing fields: {missing}"
+    if not isinstance(entry["exception"], str) or not entry["exception"].strip():
+        return False, "telemetry entry carries no traceback text"
+    cats = agent.telemetry.category_counts()
+    if sum(cats.values()) != agent.telemetry.get_exception_count():
+        return False, "category aggregate does not sum to the exception count"
+    return True, f"contained exception fully captured (type={entry['type']}, category={entry['category']})"
+
+
 def revalidate(max_latency=DEFAULT_MAX_LATENCY):
     """Run every acceptance check. Returns ``(ok, results)``."""
     rules = RulesLoader("rules_validated.json").load_rules()
@@ -232,6 +266,7 @@ def revalidate(max_latency=DEFAULT_MAX_LATENCY):
         ("latency", check_latency, [max_latency]),
         ("watering coverage", check_watering_coverage, [rules]),
         ("no silent exceptions", check_no_silent_exceptions, [rules]),
+        ("exception capture", check_exception_capture_completeness, []),
         ("archive layout", check_archive_layout, []),
     ]
     

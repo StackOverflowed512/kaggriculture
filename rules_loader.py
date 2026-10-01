@@ -20,6 +20,7 @@ EMBEDDED_RULES = {
         "hours_per_day": 24,
         "MIN_TERMINAL_TARGET": 35000,
         "CORRECTION_THRESHOLD": 45000,
+        "sell_days_buffer": 1,
     },
     "crop_params": {
         "WHEAT": {"seed": 10, "full_harvest": 4, "watering_window": [2, 4], "yield_no_fertilizer": 4, "yield_fertilized": 6, "yield_barely_alive": 1, "type": "one-time"},
@@ -38,10 +39,28 @@ EMBEDDED_RULES = {
         "STRAWBERRY": {"normal_price": 120, "curve": "linear", "halves_after": 31, "hits_floor_after": 62},
         "WOOL": {"normal_price": 200, "curve": "sq", "halves_after": 42, "hits_floor_after": 59},
     },
+    "market_heuristics": {
+        "water_cost_per_turn": 2,
+        "stock_buffer_mult": 2,
+        "default_log_decay": 0.0315,
+        "premium_price_threshold": 100,
+        "depressed_price_fraction": 0.5,
+    },
+    "care_policy": {
+        "max_crops_per_worker": 8,
+    },
+    "routing_policy": {
+        "value_weight": 0.25,
+    },
     "animal_params": {
         "GOOSE": {"cost": 300, "home": "COOP", "produces": "EGG", "starts_day": 4, "then_every_days": 1},
         "COW": {"cost": 400, "home": "PASTURE", "produces": "MILK", "starts_day": 8, "then_every_days": 2},
         "SHEEP": {"cost": 500, "home": "PASTURE", "produces": "WOOL", "starts_day": 6, "then_every_days": 3},
+    },
+    "animal_policy": {
+        "home_capacity": {"COOP": 6, "PASTURE": 4},
+        "default_home_capacity": 4,
+        "feed_per_animal": 1,
     },
     "town_model": {
         "centre_eats_every": 24,
@@ -66,6 +85,7 @@ EMBEDDED_RULES = {
         "target_hands": 10,
         "drop_pressure": 0.8,
         "endgame_start_turn": 670,
+        "worker_staleness_turns": 48,
         "ANIMALS_ENABLED": False,
         "FERTILIZER_ENABLED": False,
         "demand_forecast": False,

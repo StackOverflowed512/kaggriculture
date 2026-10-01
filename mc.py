@@ -4,12 +4,19 @@ Release step 4 of the design doc's workflow: the season simulator that plays the
 agent against reference opponents and reports the terminal-cash spread, so a
 release can be judged against the $MIN_TERMINAL_TARGET bar before submission.
 
-Two opponents ship as local stand-ins so the harness is fully wired even before
-the official baselines are dropped in:
+Six pure-Python opponents ship as local stand-ins so the harness is fully wired
+-- and the Bradley-Terry pool is genuinely diverse -- even before the official
+baselines are dropped in.  They are constructed without the engine (only *playing*
+them needs it), so the opponent pool and the held-out evaluator are unit-tested
+offline; only the real terminal-cash *numbers* wait on ``kaggle_environments``:
 
-  * ``starter`` -- a do-nothing PASS agent (the floor any real agent must beat).
-  * ``copy``    -- a fresh copy of our own agent (self-play sanity: symmetric
+  * ``starter``   -- a do-nothing PASS agent (the floor any real agent must beat).
+  * ``copy``      -- a fresh copy of our own agent (self-play sanity: symmetric
     play should straddle the target rather than collapse).
+  * ``sell_only`` -- banks shed inventory every turn, never farms.
+  * ``water_only``-- waters a crop underfoot when it needs it, else PASS.
+  * ``greedy``    -- harvests/waters the tile underfoot and liquidates the shed.
+  * ``varied``    -- a deterministic step-seeded mover (structurally distinct).
 
 The Kaggle engine (``kaggle_environments``) is not installed in this workspace.
 By default the harness reports that the engine is unavailable and exits 0
@@ -39,10 +46,20 @@ Usage:
 Exit 0 on a clean report; non-zero under ``--require-target`` with a mean below
 target, under ``--require-engine`` when the engine is missing or failure rate
 is too high, or on a bad invocation.
+
+Release-target caveat (#34): ``MIN_TERMINAL_TARGET`` ($35,000) is a *calibration
+baseline*, measured against idle/starter opponents on a limited reference setup
+-- NOT a universal competition-readiness gate.  It is deliberately overridable
+(``--target``) and its enforcement is opt-in (``--require-target``) precisely so
+it is not mistaken for a proof of readiness.  Recompute it when the opponent
+pool, season count, or evaluation variance changes; a different matchup (e.g.
+self-play, where two identical farms split one market) is a different
+measurement this bar was never meant to clear.  See VALIDATION.md.
 """
 
 import argparse
 import math
+import random
 import statistics
 import sys
 
@@ -54,8 +71,40 @@ ENGINE_ENV_CANDIDATES = ("kaggriculture", "farming", "agriculture")
 
 
 # --------------------------------------------------------------------------- #
-# Opponents
+# Opponents (all pure-Python; constructing them needs no engine)
 # --------------------------------------------------------------------------- #
+def _obs_get(obs, key, default=None):
+    """Read ``key`` from a dict-or-attr observation, defaulting when absent."""
+    if isinstance(obs, dict):
+        return obs.get(key, default)
+    return getattr(obs, key, default)
+
+
+def _crops_by_pos(obs):
+    """Index the observation's crops by ``(x, y)`` tile (best-effort, safe)."""
+    out = {}
+    for c in (_obs_get(obs, "crops", []) or []):
+        pos = c.get("pos") if isinstance(c, dict) else None
+        if pos is not None:
+            out[tuple(pos)] = c
+    return out
+
+
+def _farmer_pos(obs):
+    """The first worker's ``(x, y)`` position, or None if unreported."""
+    workers = _obs_get(obs, "workers", []) or []
+    if workers and isinstance(workers[0], dict) and workers[0].get("pos") is not None:
+        return tuple(workers[0]["pos"])
+    return None
+
+
+def _shed_sell_orders(obs, cap=10):
+    """Legal SELL orders for whatever the shed reports (capped)."""
+    shed = _obs_get(obs, "shed", {}) or {}
+    return [["SELL", item, int(qty)] for item, qty in shed.items()
+            if qty and int(qty) > 0][:cap]
+
+
 def make_starter():
     """A do-nothing baseline: always PASS. The floor a real agent must clear."""
     def starter(obs, config):
@@ -69,7 +118,73 @@ def make_copy():
     return KaggricultureAgent()
 
 
-OPPONENTS = {"starter": make_starter, "copy": make_copy}
+def make_sell_only():
+    """Banks shed inventory every turn but never farms -- a market-only floor."""
+    def sell_only(obs, config):
+        try:
+            return {"farmer": [], "hands": [], "market": _shed_sell_orders(obs)}
+        except Exception:
+            return {"farmer": [], "hands": [], "market": []}
+    return sell_only
+
+
+def make_water_only():
+    """Waters a crop the farmer stands on when it needs it, else PASS."""
+    def water_only(obs, config):
+        try:
+            crops = _crops_by_pos(obs)
+            pos = _farmer_pos(obs)
+            crop = crops.get(pos) if pos is not None else None
+            if crop and (crop.get("needs_water") or crop.get("misses", 0) >= 1):
+                return {"farmer": ["WATER"], "hands": [], "market": []}
+            return {"farmer": [], "hands": [], "market": []}
+        except Exception:
+            return {"farmer": [], "hands": [], "market": []}
+    return water_only
+
+
+def make_greedy():
+    """Harvests/waters the tile underfoot and liquidates the shed each turn."""
+    def greedy(obs, config):
+        try:
+            crops = _crops_by_pos(obs)
+            pos = _farmer_pos(obs)
+            crop = crops.get(pos) if pos is not None else None
+            action = []
+            if crop and crop.get("ready"):
+                action = ["HARVEST"]
+            elif crop and (crop.get("needs_water") or crop.get("misses", 0) >= 1):
+                action = ["WATER"]
+            return {"farmer": action, "hands": [], "market": _shed_sell_orders(obs)}
+        except Exception:
+            return {"farmer": [], "hands": [], "market": []}
+    return greedy
+
+
+def make_varied():
+    """A deterministic step-seeded mover -- structurally distinct from the rest.
+
+    Cycles the farmer through the four moves by turn index (no RNG, so play is
+    reproducible), giving the tournament graph a policy that is neither passive
+    nor economically motivated."""
+    moves = ["NORTH", "SOUTH", "EAST", "WEST"]
+    def varied(obs, config):
+        try:
+            step = int(_obs_get(obs, "step", 0) or 0)
+            return {"farmer": [moves[step % 4]], "hands": [], "market": []}
+        except Exception:
+            return {"farmer": [], "hands": [], "market": []}
+    return varied
+
+
+OPPONENTS = {
+    "starter": make_starter,
+    "copy": make_copy,
+    "sell_only": make_sell_only,
+    "water_only": make_water_only,
+    "greedy": make_greedy,
+    "varied": make_varied,
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -203,8 +318,72 @@ def format_report(opponent, summary):
 
 
 # --------------------------------------------------------------------------- #
-# Bradley-Terry tournament (engine-gated, analysis only)
+# Bradley-Terry tournament (engine-gated) + held-out evaluator (pure)
 # --------------------------------------------------------------------------- #
+def bt_holdout_eval(agents, matches, train_frac=0.7, seed=None, reg_lambda=None):
+    """Held-out evaluation of the Bradley-Terry model (pure -- no engine needed).
+
+    Splits ``matches`` (a list of ``(winner, loser)`` agent-name tuples) into a
+    train and a test partition, fits the model on the *train* partition only,
+    and scores its predictions on the held-out *test* matches.  Reports:
+
+      * ``accuracy`` -- fraction of test matches whose actual winner the model
+        gave > 50% (a hard 0/1 score), and
+      * ``log_loss`` -- mean ``-log P(actual winner)`` with the probability
+        clamped to ``[1e-12, 1-1e-12]`` (a proper scoring rule that also
+        punishes confident-but-wrong calls, not just the sign of the call).
+
+    This is the engine-free half of the manager's evaluation-layer requirement
+    (#29/#33): it exercises and unit-tests the evaluation *machinery* on given
+    match records, so predicting-on-held-out-data is validated offline.  Only
+    the live match data that would feed it still needs ``kaggle_environments`` --
+    the code path is engine-free and unit-tested on synthetic matches.
+
+    Returns a dict with ``n_train``, ``n_test``, ``accuracy`` and ``log_loss``.
+    ``accuracy``/``log_loss`` are ``None`` when the test partition is empty (too
+    few matches to hold any out), so callers never divide by zero or read a
+    fabricated score.
+    """
+    from bt_model import BradleyTerryModel
+
+    matches = list(matches)
+    n = len(matches)
+    rng = random.Random(seed)
+    order = list(range(n))
+    rng.shuffle(order)
+    n_train = int(round(n * train_frac))
+    # With >= 2 matches, guarantee at least one on each side so a valid split is
+    # never silently collapsed to train-only (no test) or test-only (no fit).
+    if n >= 2:
+        n_train = max(1, min(n - 1, n_train))
+    train = [matches[order[k]] for k in range(n_train)]
+    test = [matches[order[k]] for k in range(n_train, n)]
+
+    model = BradleyTerryModel(agents)
+    for winner, loser in train:
+        model.add_match(winner, loser)
+    model.fit(reg_lambda=reg_lambda)
+
+    if not test:
+        return {"n_train": len(train), "n_test": 0,
+                "accuracy": None, "log_loss": None}
+
+    correct = 0
+    total_ll = 0.0
+    for winner, loser in test:
+        p = model.win_probability(winner, loser)  # P(the actual winner wins)
+        if p > 0.5:
+            correct += 1
+        p_clamped = min(1 - 1e-12, max(1e-12, p))
+        total_ll += -math.log(p_clamped)
+    return {
+        "n_train": len(train),
+        "n_test": len(test),
+        "accuracy": correct / len(test),
+        "log_loss": total_ll / len(test),
+    }
+
+
 def _play_pair(engine, factory_a, factory_b):
     """Play one paired episode; return ``(reward_a, reward_b)`` or ``(None, None)``
     if the engine could not make the env or the episode crashed."""
@@ -238,6 +417,7 @@ def run_bt_tournament(engine, matches, opponents=None):
     factories.update(OPPONENTS)
 
     completed = 0
+    match_log = []  # (winner, loser) names, for the held-out evaluator
     for opp in opponents:
         for _ in range(matches):
             for a, b in ((our, opp), (opp, our)):  # both seats
@@ -246,6 +426,7 @@ def run_bt_tournament(engine, matches, opponents=None):
                     continue
                 winner, loser = (a, b) if ra > rb else (b, a)
                 bt.add_match(winner, loser)
+                match_log.append((winner, loser))
                 completed += 1
 
     if completed == 0:
@@ -254,14 +435,43 @@ def run_bt_tournament(engine, matches, opponents=None):
 
     bt.fit()
     print(f"\nBradley-Terry tournament ({completed} completed paired games):")
+
+    # Whether the played graph actually links every agent. When it does not, at
+    # least one comparison rests on the regularizer's prior rather than on games
+    # played, so we say so instead of printing a falsely authoritative ranking.
+    if not bt.is_fully_connected():
+        comps = bt.components()
+        print(f"  WARNING: match graph is not fully connected ({len(comps)} "
+              f"components: {comps}); cross-component strengths lean on the "
+              f"prior, not on head-to-head data.")
+
     for opp in opponents:
         p_model = bt.win_probability(our, opp)
         p_emp = bt.empirical_win_rate(our, opp)
         low, high = bt.confidence_interval(our, opp)
-        print(f"  vs {opp:8} | model P(win)={p_model * 100:5.1f}% | "
-              f"empirical={p_emp * 100:5.1f}% 95%CI=[{low * 100:4.1f}%, {high * 100:4.1f}%]")
-    print("  strength rankings: "
-          + ", ".join(f"{a}={s:.3f}" for a, s in bt.get_summary()))
+        # empirical_win_rate is None when the pair never met -- render "n/a"
+        # rather than a fabricated 50% (#25).
+        emp_str = "   n/a" if p_emp is None else f"{p_emp * 100:5.1f}%"
+        print(f"  vs {opp:9} | model P(win)={p_model * 100:5.1f}% | "
+              f"empirical={emp_str} 95%CI=[{low * 100:4.1f}%, {high * 100:4.1f}%]")
+
+    # Point strengths with a bootstrap uncertainty band (#28), so the ranking
+    # is never read as more precise than the handful of games behind it.
+    print("  strength rankings (with bootstrap 95% band):")
+    for a, s in bt.get_summary():
+        interval = bt.strength_interval(a, seed=0)
+        band = "" if interval is None else f" [{interval[0]:.3f}, {interval[1]:.3f}]"
+        print(f"    {a:9} = {s:.3f}{band}")
+
+    # Held-out predictive check on the same match records (pure; no engine).
+    holdout = bt_holdout_eval([our] + opponents, match_log, seed=0)
+    if holdout["accuracy"] is None:
+        print(f"  held-out eval: too few matches to split "
+              f"(n_train={holdout['n_train']}, n_test=0)")
+    else:
+        print(f"  held-out eval (train={holdout['n_train']}, "
+              f"test={holdout['n_test']}): accuracy={holdout['accuracy'] * 100:.0f}% "
+              f"log-loss={holdout['log_loss']:.3f}")
     return bt
 
 

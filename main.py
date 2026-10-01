@@ -9,7 +9,7 @@ from telemetry import Telemetry
 from market_model import MarketModel
 from care_monitor import CareMonitor
 from forecaster import Forecaster
-from scheduler import Scheduler, SHED_TILES
+from scheduler import Scheduler, SHED_TILES, TurnLedger, turn_phase
 
 
 class KaggricultureAgent:
@@ -40,6 +40,12 @@ class KaggricultureAgent:
         # each morning and dead-reckoned between turns when the observation does
         # not report positions directly.
         self.workers = {"farmer": {"pos": self.HOME, "carried": 0, "carrying_item": None}}
+        # Consecutive turns the observation has NOT reported worker state (#15).
+        # Dead-reckoning accumulates error the longer it runs uncorrected, so
+        # after policy.worker_staleness_turns obs-absent turns we stop trusting
+        # the tracked coordinates and re-anchor the crew to HOME. Reset to 0 the
+        # moment a real worker observation arrives.
+        self._turns_since_worker_obs = 0
 
     def __call__(self, obs, config):
         try:
@@ -156,16 +162,20 @@ class KaggricultureAgent:
         policy = rules["policy"]
         constants = rules["constants"]
 
-        hours_per_day = constants.get("hours_per_day", 24)
-        hour = step % hours_per_day
-        endgame_start = policy.get("endgame_start_turn", 670)
+        # Single source of temporal truth for the turn (#20): hour-of-day, day
+        # index, season length and the endgame window all come from one helper
+        # shared with the scheduler, so the day/dawn/endgame boundaries cannot
+        # drift between the live agent and the offline checks.
+        phase = turn_phase(step, rules)
+        hours_per_day = phase["hours_per_day"]
+        hour = phase["hour"]
         target_hands = policy.get("target_hands", 10)
         drop_pressure = policy.get("drop_pressure", 0.8)
         shed_size = constants["shed_size"]
 
         shed = state["shed"]
         shed_usage = sum(v for v in shed.values() if v) if shed else 0
-        in_endgame = step >= endgame_start
+        in_endgame = phase["in_endgame"]
 
         # Drop mode governs the DROP pre-emption threshold for this turn:
         #   endgame  -> bank every carried item (threshold 0)
@@ -174,7 +184,7 @@ class KaggricultureAgent:
         #   normal   -> the standard 80% threshold
         if in_endgame:
             self.scheduler.drop_mode = "endgame"
-        elif hour == hours_per_day - 1 or shed_usage >= drop_pressure * shed_size:
+        elif phase["is_last_hour"] or shed_usage >= drop_pressure * shed_size:
             self.scheduler.drop_mode = "overflow"
         else:
             self.scheduler.drop_mode = "normal"
@@ -182,25 +192,35 @@ class KaggricultureAgent:
         # Keep the crew roster current (and re-hire at midnight roll-over).
         self._sync_workers(state, hour, target_hands)
 
+        # Single turn ledger (#4): the market stage's buys raise the projected
+        # shed occupancy that the worker-assignment DROP pre-emption then reads,
+        # so both stages plan from the same post-order state instead of two
+        # independent observation snapshots.  With input buys gated off the
+        # projection equals the observed shed, so the live path is unchanged.
+        ledger = TurnLedger(shed_usage)
+
         # Market plan for the turn (morning HIRE/SELL, input buys, endgame
         # liquidation). Shared with the compliance audit via the scheduler so
         # both emit an identical bucket; the emitter applies the 10-order cap.
         for order in self.scheduler.daily_market_orders(
-            state, rules, hour, in_endgame, shed_usage=shed_usage
+            state, rules, hour, in_endgame, shed_usage=shed_usage, ledger=ledger
         ):
             emitter.add_market_order(order)
 
-        # Generate prioritized tasks and route workers to them.
+        # Generate prioritized tasks and route workers to them. The crew roster
+        # is built first so its size can bound new planting by crew throughput
+        # (#21) inside generate_tasks.
         care_capacity = self.care_monitor.capacity()
-        tasks = self.scheduler.generate_tasks(
-            state, rules, care_capacity, market_stocks=state["market_stocks"]
-        )
         workers = self._workers_list()
+        tasks = self.scheduler.generate_tasks(
+            state, rules, care_capacity, market_stocks=state["market_stocks"],
+            num_workers=len(workers),
+        )
         actions = self.scheduler.assign_tasks(
             workers,
             tasks,
             rules,
-            shed_usage=shed_usage,
+            shed_usage=ledger.usage,
             drop_mode=self.scheduler.drop_mode,
         )
 
@@ -228,7 +248,10 @@ class KaggricultureAgent:
         if state["workers"] is not None:
             # Trust the live observation for positions and carried loads.
             # This is the authoritative source -- dead-reckoning is never
-            # used when the engine reports worker state.
+            # used when the engine reports worker state.  A real reading also
+            # clears the staleness counter (#15): the tracked coordinates are
+            # now correct, so the re-anchor safety net stands down.
+            self._turns_since_worker_obs = 0
             roster = {}
             for w in state["workers"]:
                 wid = w.get("id")
@@ -244,18 +267,44 @@ class KaggricultureAgent:
             self.workers = roster
             return
 
+        # No worker observation this turn: fall back to the persistent local
+        # model and count how long we have gone without a correction (#15).
+        self._turns_since_worker_obs += 1
+        staleness_limit = 48
+        if self.rules:
+            staleness_limit = self.rules.get("policy", {}).get(
+                "worker_staleness_turns", 48)
+        stale = self._turns_since_worker_obs >= staleness_limit
+
         # Persistent local model: the farmer is permanent; the hired hands go
         # home at midnight, so we recreate them at hour 0 up to target_hands.
         # (setdefault would keep yesterday's ghost hands -- the engine has
         # already dismissed them, so emitting actions for them is at best
         # wasted and at worst an illegal-action risk.)
         farmer = self.workers.get("farmer", {"pos": self.HOME, "carried": 0, "carrying_item": None})
+        if stale:
+            # Dead-reckoning has run uncorrected past the staleness horizon:
+            # the farmer's tracked position is no longer trustworthy, so pin it
+            # back to HOME (carried load is preserved -- only the coordinate is
+            # in doubt).  Fires only at the threshold, so short obs gaps keep
+            # their dead-reckoned positions intact.
+            farmer = {
+                "pos": self.HOME,
+                "carried": farmer.get("carried", 0),
+                "carrying_item": farmer.get("carrying_item"),
+            }
         if hour == 0:
             self.workers = {"farmer": farmer}
             for i in range(target_hands):
                 self.workers[f"hand_{i}"] = {"pos": self.HOME, "carried": 0, "carrying_item": None}
         else:
-            self.workers.setdefault("farmer", farmer)
+            self.workers["farmer"] = farmer
+            if stale:
+                # Re-anchor every currently tracked worker to HOME as well, so
+                # routing this turn plans from a known tile rather than a drifted
+                # dead-reckoned guess.
+                for w in self.workers.values():
+                    w["pos"] = self.HOME
 
     def _workers_list(self):
         """Roster as a list of dicts, farmer first then hands in index order."""
@@ -308,9 +357,16 @@ class KaggricultureAgent:
                 worker["carried"] = worker.get("carried", 0) + 1
                 worker["carrying_item"] = action[1] if len(action) > 1 else None
             elif verb in ("PLACE", "FEED"):
-                # The carried item is consumed onto the tile (placed / fed).
-                worker["carried"] = max(0, worker.get("carried", 0) - 1)
-                worker["carrying_item"] = None
+                # Consume the specific carried token onto the tile (#8): PLACE
+                # sets down the carried animal, FEED hands over the carried
+                # wheat. Decrement only when actually holding something (a stray
+                # PLACE/FEED can never drive the count negative), and clear the
+                # carried-item type only once the hands are empty so the token
+                # and the count never desync.
+                if worker.get("carried", 0) > 0:
+                    worker["carried"] -= 1
+                if worker.get("carried", 0) <= 0:
+                    worker["carrying_item"] = None
             elif verb == "HARVEST":
                 # A harvest picks up the crop's full yield, not just one unit.
                 # Look up the crop at the worker's tile to get the right count;

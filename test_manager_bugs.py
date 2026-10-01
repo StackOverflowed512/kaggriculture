@@ -8,8 +8,9 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(__file__))
 
+import copy
 import pytest
-from scheduler import Scheduler, Task, SHED_TILES, manhattan, _hungarian
+from scheduler import Scheduler, Task, SHED_TILES, manhattan, _hungarian, TurnLedger
 from market_model import MarketModel
 from forecaster import Forecaster
 from care_monitor import CareMonitor
@@ -21,6 +22,15 @@ import compliance_audit
 @pytest.fixture
 def rules():
     return RulesLoader("rules_validated.json").load_rules()
+
+
+def _with_policy(rules, **flags):
+    """A deep copy of the rules with policy flags overridden (e.g. to exercise
+    the animal lifecycle with ANIMALS_ENABLED forced on without shipping it on).
+    """
+    r = copy.deepcopy(rules)
+    r["policy"].update(flags)
+    return r
 
 
 # ===========================================================================
@@ -607,10 +617,12 @@ def test_yespdf13_empirical_win_rate_is_raw_proportion():
     assert bt.empirical_win_rate("b", "a") == 0.25
 
 
-def test_yespdf13_empirical_win_rate_unplayed_pair_is_half():
+def test_yespdf13_empirical_win_rate_unplayed_pair_is_none():
+    """An unplayed pair has no observed frequency: empirical_win_rate returns
+    None (report-register #25 -- inventing 0.5 fabricates a data point)."""
     from bt_model import BradleyTerryModel
     bt = BradleyTerryModel(["a", "b"])
-    assert bt.empirical_win_rate("a", "b") == 0.5
+    assert bt.empirical_win_rate("a", "b") is None
 
 
 def test_yespdf13_ci_brackets_empirical_proportion():
@@ -659,4 +671,327 @@ def test_yespdf3_wellformed_season_raises_no_exceptions(rules):
     import revalidate
     ok, detail = revalidate.check_no_silent_exceptions(rules)
     assert ok, detail
+
+
+# ===========================================================================
+# PDF bug & defect register (kaggriculture_bug_report.pdf) -- per-item
+# regression tests for the engine-independent fixes.  Animal-lifecycle items
+# are exercised with ANIMALS_ENABLED forced on via _with_policy; the shipped
+# rules keep every such flag OFF, so these prove the gated code is correct
+# without turning it on in production.
+# ===========================================================================
+
+# --- #4: single per-turn shed projection (TurnLedger) ----------------------
+
+def test_report4_turnledger_projection_accumulates_buys():
+    """One ledger per turn carries the shed projection across planning stages;
+    only positive buys move it (#4)."""
+    led = TurnLedger(70)
+    assert led.usage == 70 and led.shed_projected == 70
+    assert led.commit_buy(5) == 75
+    assert led.usage == 75
+    # Non-positive buys never move the projection.
+    led.commit_buy(0)
+    led.commit_buy(-4)
+    assert led.usage == 75
+
+
+def test_report4_daily_orders_thread_ledger_no_buys(rules):
+    """With inputs gated off, threading a ledger through the market stage leaves
+    the projection equal to the observed shed usage (behaviour-preserving)."""
+    s = Scheduler()
+    led = TurnLedger(12)
+    state = {"shed": {"MELON": 3}, "market_stocks": {}, "animals": []}
+    s.daily_market_orders(state, rules, hour=5, in_endgame=False, ledger=led)
+    assert led.usage == 12  # no fertilizer/animal buys -> projection unchanged
+
+
+# --- #5: SELL orders ranked by projected revenue ---------------------------
+
+def test_report5_sell_orders_revenue_ranked(rules):
+    """SELL orders are ranked by projected revenue, highest first, so the 10-order
+    engine cap never truncates a high-value liquidation for a cheap one.  TOMATO
+    out-earns WHEAT though it sorts later alphabetically (#5)."""
+    orders = Scheduler._sell_orders({"WHEAT": 1, "TOMATO": 1}, rules)
+    assert orders[0] == ["SELL", "TOMATO", 1]
+    assert orders[1] == ["SELL", "WHEAT", 1]
+
+
+# --- #6: premium-price hold + feed reserve ---------------------------------
+
+def test_report6_feed_reserve_held_back_from_sell(rules):
+    """Reserved feed wheat is subtracted from the SELL quantity; a fully reserved
+    item is not sold at all (#6)."""
+    assert Scheduler._sell_orders({"WHEAT": 5}, rules, reserve={"WHEAT": 2}) == [["SELL", "WHEAT", 3]]
+    assert Scheduler._sell_orders({"WHEAT": 5}, rules, reserve={"WHEAT": 5}) == []
+
+
+def test_report6_premium_good_held_when_price_depressed(rules):
+    """A premium good (MELON) is held when the live market price has collapsed
+    below depressed_price_fraction of normal, and sold when the market is healthy
+    (#6)."""
+    held = Scheduler._sell_orders({"MELON": 4}, rules, market_stocks={"MELON": 100000})
+    assert held == []
+    sold = Scheduler._sell_orders({"MELON": 4}, rules, market_stocks={"MELON": 0})
+    assert sold == [["SELL", "MELON", 4]]
+
+
+def test_report6_endgame_liquidates_premium_regardless(rules):
+    """Endgame sells everything regardless of a depressed price (#6)."""
+    orders = Scheduler._sell_orders({"MELON": 4}, rules, endgame=True,
+                                    market_stocks={"MELON": 100000})
+    assert orders == [["SELL", "MELON", 4]]
+
+
+# --- #9: carry-lock pins a transporting worker to its matching task ---------
+
+def test_report9_carrying_worker_locked_to_matching_task(rules):
+    """A worker already carrying a fetch item is pinned to the nearest task
+    needing that item and removed from band matching, so a higher-priority band
+    cannot pull it away and strand the carried load (#9)."""
+    s = Scheduler()
+    dr = rules["daily_routines"]
+    place = Task("PLACE", (5, 5), dr["PLACE_ANIMAL"]["priority"],
+                 crop="GOOSE", item="GOOSE", fetch="GOOSE")
+    water = Task("WATER", (0, 0), dr["WATER"]["priority_dying"], crop="WHEAT")
+    carrier = {"id": "c", "pos": (5, 5), "carried": 1, "carrying_item": "GOOSE"}
+    helper = {"id": "h", "pos": (0, 0), "carried": 0}
+    actions = s.assign_tasks([carrier, helper], [place, water], rules)
+    # Carrier places the goose it stands on; it was NOT diverted to the higher
+    # WATER band.  The free helper takes the water.
+    assert actions["c"] == ["PLACE"]
+    assert actions["h"] == ["WATER"]
+
+
+# --- #10: named reservations on the ledger ---------------------------------
+
+def test_report10_ledger_named_feed_reservation():
+    """feed_reserved is a named item->qty map distinct from the occupancy
+    projection; non-positive reservations are ignored (#10)."""
+    led = TurnLedger(10)
+    led.reserve_feed("WHEAT", 3)
+    led.reserve_feed("WHEAT", 2)
+    assert led.feed_reserved == {"WHEAT": 5}
+    assert led.usage == 10  # reservation is separate from shed occupancy
+    led.reserve_feed("WHEAT", 0)
+    led.reserve_feed("CORN", -1)
+    assert led.feed_reserved == {"WHEAT": 5}
+
+
+def test_report10_daily_orders_reserve_feed_for_placed_flock(rules):
+    """With animals enabled, each placed animal reserves feed wheat that the
+    morning SELL then holds back (#6/#10)."""
+    r = _with_policy(rules, ANIMALS_ENABLED=True)
+    s = Scheduler()
+    led = TurnLedger(0)
+    state = {
+        "shed": {"WHEAT": 4},
+        "market_stocks": {},
+        "animals": [{"type": "GOOSE", "placed": True, "home_pos": (4, 4),
+                     "home_built": True, "owned": True}],
+    }
+    orders = s.daily_market_orders(state, r, hour=0, in_endgame=False, ledger=led)
+    assert led.feed_reserved.get("WHEAT") == 1  # 1 placed goose * feed_per_animal 1
+    sells = [o for o in orders if o[0] == "SELL"]
+    assert ["SELL", "WHEAT", 3] in sells  # 4 wheat - 1 reserved = 3 sold
+
+
+# --- #12: plant-choice memoization -----------------------------------------
+
+def test_report12_choose_plant_crop_memoized(rules, monkeypatch):
+    """_choose_plant_crop caches its (step, market-stock) result so re-entering
+    within a turn does not re-run the crop-EV sort; a new key recomputes (#12)."""
+    s = Scheduler()
+    calls = {"n": 0}
+    real = MarketModel.crop_values
+
+    def counting(r, stocks):
+        calls["n"] += 1
+        return real(r, stocks)
+
+    monkeypatch.setattr(MarketModel, "crop_values", staticmethod(counting))
+    a = s._choose_plant_crop(rules, 100, {"MELON": 5})
+    b = s._choose_plant_crop(rules, 100, {"MELON": 5})
+    assert a == b
+    assert calls["n"] == 1  # second call served from cache
+    s._choose_plant_crop(rules, 101, {"MELON": 5})  # new step -> recompute
+    assert calls["n"] == 2
+
+
+# --- #13: planting deferred while an animal home is unbuilt -----------------
+
+def test_report13_planting_deferred_while_home_unbuilt(rules):
+    """While an animal home still needs building, the BUILD task defers
+    speculative planting for the turn (#13)."""
+    r = _with_policy(rules, ANIMALS_ENABLED=True)
+    s = Scheduler()
+    obs = {
+        "step": 24, "crops": [], "weeds": [], "empty_tiles": [(6, 6)],
+        "market_stocks": {},
+        "animals": [{"type": "GOOSE", "home_pos": (4, 4), "home_built": False}],
+    }
+    tasks = s.generate_tasks(obs, r, care_capacity=100, market_stocks={})
+    kinds = [t.kind for t in tasks]
+    assert "BUILD_COOP" in kinds
+    assert not any(t.kind == "PLANT" for t in tasks)
+
+
+def test_report13_planting_resumes_when_no_infra_pending(rules):
+    """With no BUILD pending, planting proceeds normally (#13 gate is inert)."""
+    r = _with_policy(rules, ANIMALS_ENABLED=True)
+    s = Scheduler()
+    obs = {
+        "step": 24, "crops": [], "weeds": [], "empty_tiles": [(6, 6)],
+        "market_stocks": {},
+        "animals": [{"type": "GOOSE", "home_pos": (4, 4), "home_built": True,
+                     "owned": False}],
+    }
+    tasks = s.generate_tasks(obs, r, care_capacity=100, market_stocks={})
+    assert any(t.kind == "PLANT" for t in tasks)
+
+
+# --- #14: FEED rationed to available wheat ---------------------------------
+
+def test_report14_feed_rationed_to_available_wheat(rules):
+    """When the shed holds some wheat but less than the unfed flock needs, only
+    as many FEED tasks as there is wheat are emitted -- no empty-handed wheat
+    PICKUPs (#14)."""
+    r = _with_policy(rules, ANIMALS_ENABLED=True)
+    s = Scheduler()
+    animals = [{"type": "GOOSE", "placed": True, "fed_today": False,
+                "home_pos": (a, a), "home_built": True, "owned": True}
+               for a in (3, 4, 5)]  # 3 unfed placed geese
+    obs = {"step": 100, "crops": [], "weeds": [], "empty_tiles": [],
+           "market_stocks": {}, "shed": {"WHEAT": 1}, "animals": animals}
+    feeds = [t for t in s._animal_tasks(obs, r) if t.kind == "FEED"]
+    assert len(feeds) == 1  # rationed to the single available wheat
+
+
+def test_report14_feed_not_suppressed_when_shed_empty(rules):
+    """A reported-empty shed is 'supply unknown/incoming' and must NOT suppress
+    the need-driven FEED task (#14 preserves the need-driven behaviour)."""
+    r = _with_policy(rules, ANIMALS_ENABLED=True)
+    s = Scheduler()
+    obs = {"step": 100, "crops": [], "weeds": [], "empty_tiles": [],
+           "market_stocks": {}, "shed": {}, "animals": [
+               {"type": "GOOSE", "placed": True, "fed_today": False,
+                "home_pos": (4, 4), "home_built": True, "owned": True}]}
+    feeds = [t for t in s._animal_tasks(obs, r) if t.kind == "FEED"]
+    assert len(feeds) == 1
+
+
+# --- #2: BUILD -> PLACE -> HARVEST/FEED chain is reachable ------------------
+
+def test_report2_animal_lifecycle_chain_reachable(rules):
+    """Each lifecycle stage yields the right task as an animal advances
+    Build home -> Place -> (daily Feed + Harvest) (#2)."""
+    r = _with_policy(rules, ANIMALS_ENABLED=True)
+    s = Scheduler()
+
+    def kinds(animal):
+        obs = {"step": 100, "crops": [], "weeds": [], "empty_tiles": [],
+               "market_stocks": {}, "shed": {"WHEAT": 5}, "animals": [animal]}
+        return {t.kind for t in s._animal_tasks(obs, r)}
+
+    base = {"type": "GOOSE", "home_pos": (4, 4)}
+    # Stage 1: no home yet -> BUILD_COOP.
+    assert "BUILD_COOP" in kinds({**base, "home_built": False})
+    # Stage 2: home built, owned, not placed -> PLACE.
+    assert "PLACE" in kinds({**base, "home_built": True, "owned": True, "placed": False})
+    # Stage 3: placed, ripe + unfed -> HARVEST and FEED.
+    producing = kinds({**base, "home_built": True, "owned": True, "placed": True,
+                       "ready": True, "fed_today": False})
+    assert "HARVEST" in producing
+    assert "FEED" in producing
+
+
+# --- #17: REQ-07 telemetry capture-completeness release gate ----------------
+
+def test_report17_req07_registered():
+    """The capture-completeness check is wired into the release gate under its
+    own requirement id, so the traceability report records it (#17)."""
+    import revalidate
+    assert hasattr(revalidate, "check_exception_capture_completeness")
+    assert revalidate.check_exception_capture_completeness.req_id == "REQ-07-CAPTURE"
+
+
+def test_report17_capture_completeness_passes():
+    """A contained exception is fully captured: count + log entry carrying
+    step/type/category/traceback, with the category aggregate summing to the
+    count (#16/#17)."""
+    import revalidate
+    ok, detail = revalidate.check_exception_capture_completeness()
+    assert ok, detail
+
+
+def test_report17_telemetry_tags_and_aggregates_by_category():
+    """Telemetry classifies each contained exception and the by-category
+    aggregate sums to the total -- the data REQ-07 audits (#16)."""
+    from telemetry import Telemetry
+    t = Telemetry()
+    t.record_exception(1, KeyError("missing"))
+    t.record_exception(2, TypeError("bad"))
+    t.record_exception(3, ZeroDivisionError("div0"))
+    assert t.get_exception_count() == 3
+    assert all({"step", "type", "category", "exception"} <= set(e)
+               for e in t.exceptions_log)
+    cats = t.category_counts()
+    assert cats.get("data") == 2        # KeyError + TypeError
+    assert cats.get("arithmetic") == 1  # ZeroDivisionError
+    assert sum(cats.values()) == t.get_exception_count()
+
+
+def test_report17_req07_in_release_gate(rules):
+    """REQ-07 is one of the checks the gate actually runs, and it reports PASS in
+    the traceability record (#17)."""
+    import revalidate
+    ok, results = revalidate.revalidate()
+    assert ok, results
+    req_ids = {req for req, _name, _passed in revalidate._requirements_tested}
+    assert "REQ-07-CAPTURE" in req_ids
+    assert all(passed for req, _name, passed in revalidate._requirements_tested
+               if req == "REQ-07-CAPTURE")
+
+
+# --- #19: demand approximation is sourced from the rules artifact -----------
+
+def test_report19_town_demand_dormant_by_default(rules):
+    """Strategy-level demand modelling stays OFF in the shipped rules, so the
+    live path never acts on an unvalidated approximation (#19)."""
+    assert rules["policy"].get("demand_forecast") is False
+    assert MarketModel.town_demand(rules, 240) == {}
+
+
+def test_report19_town_demand_sourced_from_town_model(rules):
+    """When enabled, every quantity is computed from the validated rules
+    artifact's town_model -- not hard-coded engine facts (#19)."""
+    r = _with_policy(rules, demand_forecast=True)
+    tm = r["town_model"]
+    horizon = 240
+    d = MarketModel.town_demand(r, horizon)
+    centre = (horizon // tm["centre_eats_every"]) * tm["specialized_amount"]
+    shops = tm["max_shops"] * (horizon // tm["shop_eats_every"]) * tm["shop_amount"]
+    assert d["centre_units"] == centre
+    assert d["shop_units"] == shops
+    assert d["total_units"] == centre + shops
+
+
+def test_report19_town_demand_tracks_artifact_changes(rules):
+    """Mutating a town_model value changes the output, proving the helper reads
+    the authoritative artifact rather than a duplicated constant (#19)."""
+    r = _with_policy(rules, demand_forecast=True)
+    base = MarketModel.town_demand(r, 240)["total_units"]
+    r2 = copy.deepcopy(r)
+    r2["town_model"]["shop_amount"] *= 2
+    bumped = MarketModel.town_demand(r2, 240)["total_units"]
+    assert bumped > base  # demand follows the rules artifact, not a literal
+
+
+def test_report19_town_demand_guards_bad_horizon(rules):
+    """A non-positive or non-numeric horizon yields no demand, never a crash (#19)."""
+    r = _with_policy(rules, demand_forecast=True)
+    assert MarketModel.town_demand(r, 0) == {}
+    assert MarketModel.town_demand(r, -5) == {}
+    assert MarketModel.town_demand(r, None) == {}
+
 
