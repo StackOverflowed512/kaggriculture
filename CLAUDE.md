@@ -64,7 +64,37 @@ You need to implement `scheduler.py` to coordinate tasks and direct workers:
 *   **DROP Pre-emption**: If carried load + shed capacity > `policy.drop_pressure` (80%), intercept the worker, remove them from scheduler bands, and direct them to the shed. Tighten threshold to 50% under overflow threat, and to 0 during endgame liquidation.
 
 ### Phase 4: Validation and Advanced Logic
-*   **Animal Lifecycle**: Implement placeholder logic when `ANIMALS_ENABLED` is flipped in rules (Build home -> Buy animal -> Pickup -> Place -> Feed daily -> Care).
-*   **Fertilizer Logic**: Implement buying fertilizer directly from the market.
+*   **Animal Lifecycle**: Implemented and unit-tested for code-correctness (Build home -> Buy animal -> Pickup -> Place -> Feed daily -> Care/Harvest), but **gated behind `policy.ANIMALS_ENABLED`, which ships `false`**. The code path is exercised only by forcing the flag on in tests; it is **not** validated against the live Kaggle engine. See §5 before treating it as a usable capability.
+*   **Fertilizer Logic**: Market fertilizer purchases are implemented but gated behind `policy.FERTILIZER_ENABLED` (ships `false`); same validation caveat as animals.
 *   **Release Checks**: Create `build_submission.py` to check embedded rules match sources and package `main.py` + `rules_validated.json` into `submission.tar.gz`.
 *   **Simulated Auditing**: Build `revalidate.py` (offline correctness) and `compliance_audit.py` (plays seasons to check for illegal/wasted actions).
+
+---
+
+## 5. Validation Status & Caveats (Non-Negotiable)
+
+**Implemented ≠ validated.** Passing the unit suite proves code-level correctness
+against our *own* model of the rules; it does **not** prove correctness against
+the actual competition engine, nor competitive strength. Keep these distinct in
+every status claim (register #31, #32, #35):
+
+*   **Validated offline**: the engine contract (list-typed `{farmer, hands, market}`
+    envelope, 10-order cap, $1 floor), exception containment + capture
+    (`revalidate.py` REQ-01…REQ-07), rule-artifact parity (`validate_rules.py`,
+    `build_submission.py`), and a clean compliance audit on the synthetic season.
+*   **Implemented but gated OFF and engine-unvalidated**: the animal lifecycle
+    (`ANIMALS_ENABLED`), market fertilizer (`FERTILIZER_ENABLED`), and the
+    `town_model` demand helper (`demand_forecast`). All three flags ship `false`.
+    Their code is unit-tested with the flag forced on for *correctness only* —
+    do not describe them as working capabilities until demonstrated on the live
+    engine.
+*   **Not demonstrated here (needs `kaggle_environments`)**: exact-engine
+    correctness and multi-opponent robustness (#31, #32); held-out / exogenous /
+    overfitting evidence for the Bradley-Terry analysis (#29, #30, #33).
+*   **`MIN_TERMINAL_TARGET` ($35,000) is a calibration baseline, not a universal
+    release gate (#34)**: it was calibrated against idle/starter opponents on a
+    limited setup. It is overridable (`mc.py --target`) and enforced only opt-in
+    (`--require-target`). Recompute it when the opponent pool, season count, or
+    evaluation variance changes.
+
+The authoritative, per-item breakdown lives in `VALIDATION.md`.
