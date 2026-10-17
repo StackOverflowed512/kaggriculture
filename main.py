@@ -9,13 +9,15 @@ from telemetry import Telemetry
 from market_model import MarketModel
 from care_monitor import CareMonitor
 from forecaster import Forecaster
-from scheduler import Scheduler
+from scheduler import Scheduler, SHED_TILES, TurnLedger, turn_phase
 
 
 class KaggricultureAgent:
     # Where a worker starts / returns to when we have no observed position.
-    # A central tile keeps early walking short; live games overwrite this from obs.
-    HOME = (4, 4)
+    # The shed's first centre tile keeps early walking short (it is where drops
+    # happen) and ties the default to the single SHED_TILES source; live games
+    # overwrite this from obs.
+    HOME = SHED_TILES[0]
 
     # Coordinate deltas for dead-reckoning persistent worker positions between
     # turns (see scheduler.py for the (x, y) / NORTH-SOUTH-EAST-WEST convention).
@@ -37,29 +39,28 @@ class KaggricultureAgent:
         # The permanent farmer is always present; hired hands are (re)created
         # each morning and dead-reckoned between turns when the observation does
         # not report positions directly.
-        self.workers = {"farmer": {"pos": self.HOME, "carried": 0}}
+        self.workers = {"farmer": {"pos": self.HOME, "carried": 0, "carrying_item": None}}
+        # Consecutive turns the observation has NOT reported worker state (#15).
+        # Dead-reckoning accumulates error the longer it runs uncorrected, so
+        # after policy.worker_staleness_turns obs-absent turns we stop trusting
+        # the tracked coordinates and re-anchor the crew to HOME. Reset to 0 the
+        # moment a real worker observation arrives.
+        self._turns_since_worker_obs = 0
 
     def __call__(self, obs, config):
-        step = obs.step if hasattr(obs, 'step') else obs.get('step', 0)
-
         try:
+            step = obs.step if hasattr(obs, 'step') else obs.get('step', 0)
             # Load rules if not already loaded
             if self.rules is None:
                 self.rules = self.rules_loader.load_rules()
 
-            # Initialize ActionEmitter for the current turn
-            max_orders = self.rules["constants"]["max_market_orders"]
-            emitter = ActionEmitter(max_market_orders=max_orders)
+            constants = self.rules["constants"]
+            hours_per_day = constants.get("hours_per_day", 24)
+            season_length = constants.get("season_length", 720)
 
-            # Phase 2 Integration: end-of-day monitoring update.
-            # Realized/missed values are still mocked here; wiring them to real
-            # observation deltas is future work and does not affect emission.
-            if step > 0 and step % 24 == 0:
-                day = step // 24
-                self.care_monitor.observe_day(day, 0)
-                realized_money = 1000
-                projected_yesterday = self.forecaster.last_prediction or 1000
-                self.forecaster.observe(day, realized_money, projected_yesterday)
+            # Initialize ActionEmitter for the current turn
+            max_orders = constants["max_market_orders"]
+            emitter = ActionEmitter(max_market_orders=max_orders)
 
             # Phase 3: run the operational core only when the observation carries
             # board state. A bare observation (no crops/weeds/workers/etc.) leaves
@@ -69,12 +70,43 @@ class KaggricultureAgent:
                 emitter.set_farmer_action([])
                 return emitter.emit()
 
+            # End-of-day monitoring update, driven by real observation signals
+            # where the engine reports them. Missed-watering count feeds the
+            # CareMonitor's acreage control; realized cash calibrates yesterday's
+            # forecast. Absent fields default to no-ops so the monitors stay
+            # dormant rather than acting on mocked numbers.
+            if step > 0 and step % hours_per_day == 0:
+                day = step // hours_per_day
+                self.care_monitor.observe_day(day, state.get("missed_waterings", 0) or 0)
+                realized_money = state.get("money")
+                projected_yesterday = self.forecaster.last_prediction
+                if realized_money is not None and projected_yesterday:
+                    self.forecaster.observe(day, realized_money, projected_yesterday)
+
             self._run_operations(state, step, emitter)
+
+            # Refresh the terminal-cash projection for tomorrow's calibration,
+            # but only when the observation actually reports current cash.
+            money = state.get("money")
+            if money is not None:
+                self.forecaster.project(
+                    self.rules, money, state["shed"], state["crops"],
+                    state["market_stocks"],
+                )
+
+            if step == season_length - 1:
+                self.telemetry.flush_to_disk()
             return emitter.emit()
 
         except Exception as e:
             # Exception containment: never crash the season
-            self.telemetry.record_exception(step, e)
+            step_val = step if 'step' in locals() else -1
+            self.telemetry.record_exception(step_val, e)
+            # Recurring-exception detection: if exceptions keep happening,
+            # the agent is silently PASSing and wasting the entire season.
+            # Telemetry records this so the validation pipeline can treat
+            # any exception count > 0 as a release blocker.
+            self.telemetry.flush_to_disk()
 
             # Degrade gracefully to PASS
             return {
@@ -97,9 +129,16 @@ class KaggricultureAgent:
         else:
             get = lambda key, default=None: getattr(obs, key, default)
 
-        board_keys = ("crops", "weeds", "empty_tiles", "workers", "shed", "market_stocks")
+        board_keys = ("crops", "weeds", "empty_tiles", "workers", "shed", "market_stocks", "animals")
         if not any(get(k) is not None for k in board_keys):
             return None
+
+        # Current cash may be reported as "money" or "cash"; keep it as None when
+        # absent (distinct from a real $0) so the forecaster only calibrates on
+        # genuine readings.
+        money = get("money")
+        if money is None:
+            money = get("cash")
 
         return {
             "step": get("step", 0) or 0,
@@ -109,6 +148,9 @@ class KaggricultureAgent:
             "workers": get("workers"),  # None -> use persistent model
             "shed": get("shed") or {},
             "market_stocks": get("market_stocks") or {},
+            "animals": get("animals") or [],  # Phase 4: animal lifecycle slots
+            "money": money,  # None when the observation does not report cash
+            "missed_waterings": get("missed_waterings", 0) or 0,
         }
 
     # ------------------------------------------------------------------ #
@@ -120,15 +162,20 @@ class KaggricultureAgent:
         policy = rules["policy"]
         constants = rules["constants"]
 
-        hour = step % 24
-        endgame_start = policy.get("endgame_start_turn", 670)
+        # Single source of temporal truth for the turn (#20): hour-of-day, day
+        # index, season length and the endgame window all come from one helper
+        # shared with the scheduler, so the day/dawn/endgame boundaries cannot
+        # drift between the live agent and the offline checks.
+        phase = turn_phase(step, rules)
+        hours_per_day = phase["hours_per_day"]
+        hour = phase["hour"]
         target_hands = policy.get("target_hands", 10)
         drop_pressure = policy.get("drop_pressure", 0.8)
         shed_size = constants["shed_size"]
 
         shed = state["shed"]
         shed_usage = sum(v for v in shed.values() if v) if shed else 0
-        in_endgame = step >= endgame_start
+        in_endgame = phase["in_endgame"]
 
         # Drop mode governs the DROP pre-emption threshold for this turn:
         #   endgame  -> bank every carried item (threshold 0)
@@ -137,7 +184,7 @@ class KaggricultureAgent:
         #   normal   -> the standard 80% threshold
         if in_endgame:
             self.scheduler.drop_mode = "endgame"
-        elif hour == 23 or shed_usage >= drop_pressure * shed_size:
+        elif phase["is_last_hour"] or shed_usage >= drop_pressure * shed_size:
             self.scheduler.drop_mode = "overflow"
         else:
             self.scheduler.drop_mode = "normal"
@@ -145,31 +192,43 @@ class KaggricultureAgent:
         # Keep the crew roster current (and re-hire at midnight roll-over).
         self._sync_workers(state, hour, target_hands)
 
-        # Daily routine at hour 0: re-hire the whole crew, then sell the shed.
-        # HIRE and SELL share the market bucket's 10-order cap (engine contract);
-        # HIRE is emitted first, mirroring the handover's morning order.
-        if hour == 0:
-            self._emit_hire(emitter, target_hands)
-            self._emit_sells(emitter, shed)
+        # Single turn ledger (#4): the market stage's buys raise the projected
+        # shed occupancy that the worker-assignment DROP pre-emption then reads,
+        # so both stages plan from the same post-order state instead of two
+        # independent observation snapshots.  With input buys gated off the
+        # projection equals the observed shed, so the live path is unchanged.
+        ledger = TurnLedger(shed_usage)
 
-        # Endgame liquidation overlay: phone the broker EVERY turn (not just at
-        # hour 0) to convert inventory to cash before the season ends. Buying new
-        # land or animals is disabled here (no such purchases are built yet).
-        if in_endgame and hour != 0:
-            self._emit_sells(emitter, shed)
+        # Market plan for the turn (morning HIRE/SELL, input buys, endgame
+        # liquidation). Shared with the compliance audit via the scheduler so
+        # both emit an identical bucket; the emitter applies the 10-order cap.
+        for order in self.scheduler.daily_market_orders(
+            state, rules, hour, in_endgame, shed_usage=shed_usage, ledger=ledger
+        ):
+            emitter.add_market_order(order)
 
-        # Generate prioritized tasks and route workers to them.
+        # Generate prioritized tasks and route workers to them. The crew roster
+        # is built first so its size can bound new planting by crew throughput
+        # (#21) inside generate_tasks.
         care_capacity = self.care_monitor.capacity()
+        workers = self._workers_list()
         tasks = self.scheduler.generate_tasks(
-            state, rules, care_capacity, market_stocks=state["market_stocks"]
+            state, rules, care_capacity, market_stocks=state["market_stocks"],
+            num_workers=len(workers),
         )
         actions = self.scheduler.assign_tasks(
-            self._workers_list(),
+            workers,
             tasks,
             rules,
-            shed_usage=shed_usage,
+            shed_usage=ledger.usage,
             drop_mode=self.scheduler.drop_mode,
         )
+
+        # Feed the real idle fraction back to the CareMonitor so it can grow
+        # acreage when the crew has spare hands (and shrink it on thirst above).
+        if workers:
+            idle = sum(1 for w in workers if not actions.get(w["id"])) / len(workers)
+            self.care_monitor.note_idle(idle)
 
         self._emit_worker_actions(actions, emitter)
         self._advance_positions(state, actions)
@@ -178,25 +237,74 @@ class KaggricultureAgent:
     # Worker roster helpers
     # ------------------------------------------------------------------ #
     def _sync_workers(self, state, hour, target_hands):
-        """Refresh the roster from the observation, or maintain it locally."""
+        """Refresh the roster from the observation, or maintain it locally.
+
+        The engine observation is authoritative when present.  When it is
+        absent (None), we fall back to the persistent local model and
+        dead-reckon positions.  This is a safety net, not a primary source --
+        if the engine ever reports worker state we immediately discard our
+        dead-reckoned model and trust the observation.
+        """
         if state["workers"] is not None:
             # Trust the live observation for positions and carried loads.
+            # This is the authoritative source -- dead-reckoning is never
+            # used when the engine reports worker state.  A real reading also
+            # clears the staleness counter (#15): the tracked coordinates are
+            # now correct, so the re-anchor safety net stands down.
+            self._turns_since_worker_obs = 0
             roster = {}
             for w in state["workers"]:
-                roster[w["id"]] = {
-                    "pos": tuple(w["pos"]),
+                wid = w.get("id")
+                wpos = w.get("pos")
+                if wid is None or wpos is None:
+                    continue
+                roster[wid] = {
+                    "pos": tuple(wpos),
                     "carried": w.get("carried", 0),
+                    "carrying_item": w.get("carrying_item"),
                 }
-            roster.setdefault("farmer", {"pos": self.HOME, "carried": 0})
+            roster.setdefault("farmer", {"pos": self.HOME, "carried": 0, "carrying_item": None})
             self.workers = roster
             return
 
+        # No worker observation this turn: fall back to the persistent local
+        # model and count how long we have gone without a correction (#15).
+        self._turns_since_worker_obs += 1
+        staleness_limit = 48
+        if self.rules:
+            staleness_limit = self.rules.get("policy", {}).get(
+                "worker_staleness_turns", 48)
+        stale = self._turns_since_worker_obs >= staleness_limit
+
         # Persistent local model: the farmer is permanent; the hired hands go
-        # home at midnight, so we (re)create them at hour 0 up to target_hands.
-        self.workers.setdefault("farmer", {"pos": self.HOME, "carried": 0})
+        # home at midnight, so we recreate them at hour 0 up to target_hands.
+        # (setdefault would keep yesterday's ghost hands -- the engine has
+        # already dismissed them, so emitting actions for them is at best
+        # wasted and at worst an illegal-action risk.)
+        farmer = self.workers.get("farmer", {"pos": self.HOME, "carried": 0, "carrying_item": None})
+        if stale:
+            # Dead-reckoning has run uncorrected past the staleness horizon:
+            # the farmer's tracked position is no longer trustworthy, so pin it
+            # back to HOME (carried load is preserved -- only the coordinate is
+            # in doubt).  Fires only at the threshold, so short obs gaps keep
+            # their dead-reckoned positions intact.
+            farmer = {
+                "pos": self.HOME,
+                "carried": farmer.get("carried", 0),
+                "carrying_item": farmer.get("carrying_item"),
+            }
         if hour == 0:
+            self.workers = {"farmer": farmer}
             for i in range(target_hands):
-                self.workers.setdefault(f"hand_{i}", {"pos": self.HOME, "carried": 0})
+                self.workers[f"hand_{i}"] = {"pos": self.HOME, "carried": 0, "carrying_item": None}
+        else:
+            self.workers["farmer"] = farmer
+            if stale:
+                # Re-anchor every currently tracked worker to HOME as well, so
+                # routing this turn plans from a known tile rather than a drifted
+                # dead-reckoned guess.
+                for w in self.workers.values():
+                    w["pos"] = self.HOME
 
     def _workers_list(self):
         """Roster as a list of dicts, farmer first then hands in index order."""
@@ -213,7 +321,12 @@ class KaggricultureAgent:
         result = []
         for wid in sorted(self.workers, key=order):
             w = self.workers[wid]
-            result.append({"id": wid, "pos": tuple(w["pos"]), "carried": w.get("carried", 0)})
+            result.append({
+                "id": wid,
+                "pos": tuple(w["pos"]),
+                "carried": w.get("carried", 0),
+                "carrying_item": w.get("carrying_item"),
+            })
         return result
 
     def _advance_positions(self, state, actions):
@@ -232,26 +345,47 @@ class KaggricultureAgent:
             if verb in self._MOVE_DELTA:
                 dx, dy = self._MOVE_DELTA[verb]
                 x, y = worker["pos"]
-                worker["pos"] = (x + dx, y + dy)
+                # Clamp to the 10x10 board so dead-reckoning can never drift
+                # off-grid even if a step action was emitted at a boundary.
+                nx, ny = max(0, min(9, x + dx)), max(0, min(9, y + dy))
+                worker["pos"] = (nx, ny)
             elif verb == "DROP":
                 worker["carried"] = 0
+                worker["carrying_item"] = None
+            elif verb == "PICKUP":
+                # Fetching a specific item from the shed (wheat, an animal).
+                worker["carried"] = worker.get("carried", 0) + 1
+                worker["carrying_item"] = action[1] if len(action) > 1 else None
+            elif verb in ("PLACE", "FEED"):
+                # Consume the specific carried token onto the tile (#8): PLACE
+                # sets down the carried animal, FEED hands over the carried
+                # wheat. Decrement only when actually holding something (a stray
+                # PLACE/FEED can never drive the count negative), and clear the
+                # carried-item type only once the hands are empty so the token
+                # and the count never desync.
+                if worker.get("carried", 0) > 0:
+                    worker["carried"] -= 1
+                if worker.get("carried", 0) <= 0:
+                    worker["carrying_item"] = None
             elif verb == "HARVEST":
-                worker["carried"] += 1
+                # A harvest picks up the crop's full yield, not just one unit.
+                # Look up the crop at the worker's tile to get the right count;
+                # fall back to 1 if the tile is unknown (shouldn't happen, but
+                # keeps the local model from undercounting on edge cases).
+                crop = next((c for c in state.get("crops", [])
+                             if tuple(c.get("pos", (-1, -1))) == worker["pos"]), None)
+                if crop:
+                    params = self.rules.get("crop_params", {}).get(crop.get("type"), {})
+                    if crop.get("fertilized", False):
+                        worker["carried"] += params.get("yield_fertilized", params.get("yield_no_fertilizer", 1))
+                    else:
+                        worker["carried"] += params.get("yield_no_fertilizer", 1)
+                else:
+                    worker["carried"] += 1
 
     # ------------------------------------------------------------------ #
     # Emission helpers
     # ------------------------------------------------------------------ #
-    def _emit_hire(self, emitter, target_hands):
-        """Emit one HIRE order per hand to bring the crew up to strength."""
-        for _ in range(target_hands):
-            emitter.add_market_order(["HIRE"])
-
-    def _emit_sells(self, emitter, shed):
-        """Emit a SELL order for every shed item that has stock."""
-        for item, qty in shed.items():
-            if qty and qty > 0:
-                emitter.add_market_order(["SELL", item, int(qty)])
-
     def _emit_worker_actions(self, actions, emitter):
         """Route the scheduler's per-worker actions into the emitter buckets."""
         for worker in self._workers_list():
